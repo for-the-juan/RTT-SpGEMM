@@ -342,6 +342,8 @@ __global__ void set_row_nz_bin_pwarp(const int *d_arpt, const int *d_acol,
     int rid = i / PWARP;
     int tid = i % PWARP;
     int local_rid = rid % (blockDim.x / PWARP);
+    const unsigned int pwarp_mask =
+        0xfu << (((threadIdx.x & (WARP - 1)) / PWARP) * PWARP);
   
     int j, k;
     int soffset;
@@ -352,7 +354,8 @@ __global__ void set_row_nz_bin_pwarp(const int *d_arpt, const int *d_acol,
   
     for (j = tid; j < IMB_PWMIN; j += PWARP) {
         check[soffset + j] = -1;
-    }//__syncwarp();
+    }
+    __syncwarp(pwarp_mask);
     if (rid >= M) {
         return;
     }
@@ -385,13 +388,13 @@ __global__ void set_row_nz_bin_pwarp(const int *d_arpt, const int *d_acol,
         }////__syncwarp();
     }//__syncwarp();
 
-    __syncwarp();
+    __syncwarp(pwarp_mask);
   
     for (j = PWARP / 2; j >= 1; j /= 2) {
-        nz += __shfl_xor_sync(0xffffffff, nz, j);
+        nz += __shfl_xor_sync(pwarp_mask, nz, j, PWARP);
     }
     
-    __syncwarp();
+    __syncwarp(pwarp_mask);
 
     if (tid == 0) {
         d_row_nz[rid] = nz;
