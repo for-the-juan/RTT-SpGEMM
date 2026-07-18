@@ -746,6 +746,29 @@ static inline int spgemm_cusparse_device_pair(
     return validation_result;
 }
 
+/* General device-resident A*B structural validation.  Both input CSRs are
+ * borrowed from the caller; no input or result values are copied to host. */
+static inline int spgemm_cusparse_device_ab(
+    const int mA, const int nA, const int nnzA,
+    const int *d_csrRowPtrA, const int *d_csrColIdxA,
+    const VALUE_TYPE *d_csrValA,
+    const int mB, const int nB, const int nnzB,
+    const int *d_csrRowPtrB, const int *d_csrColIdxB,
+    const VALUE_TYPE *d_csrValB,
+    const int mC, const int nC, const int nnzC_golden,
+    const int *h_csrRowPtrC_golden, const int *h_csrColIdxC_golden,
+    const bool check_result, unsigned long long int nnzCub,
+    unsigned long long int *nnzC, double *compression_rate,
+    double *time_segmerge, double *gflops_segmerge)
+{
+    return spgemm_cusparse_device_pair(
+        mA, nA, nnzA, d_csrRowPtrA, d_csrColIdxA, d_csrValA,
+        mB, nB, nnzB, d_csrRowPtrB, d_csrColIdxB, d_csrValB,
+        mC, nC, nnzC_golden, h_csrRowPtrC_golden,
+        h_csrColIdxC_golden, check_result, nnzCub, nnzC,
+        compression_rate, time_segmerge, gflops_segmerge);
+}
+
 static inline int spgemm_cusparse_device(
     const int mA, const int nA, const int nnzA,
     const int *d_csrRowPtrA, const int *d_csrColIdxA,

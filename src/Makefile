@@ -5,6 +5,9 @@ CUDA_PATH ?= $(CUDA_INSTALL_PATH)
 NVCC ?= nvcc
 TARGET ?= test
 GPU_PREPROCESS_TEST_TARGET ?= gpu_dmma_tiles_test
+DMMA_DYNAMIC_TEST_TARGET ?= dmma_dynamic_b_test
+TILE2CSR_RESTORE_TEST_TARGET ?= tile2csr_restore_test
+DMMA_WIDE_TEST_TARGET ?= dmma_wide_mask_spa_test
 
 #GLOBAL_PARAMETERS
 MAT_VAL_TYPE = double
@@ -28,10 +31,31 @@ LIBS = $(CUDA_LIBS)
 make:
 	$(NVCC) $(NVCC_FLAGS) $(GENCODE_FLAGS) -Xcompiler -fopenmp -Xcompiler -mfma main.cu -o $(TARGET) $(INCLUDES) $(LIBS) $(OPTIONS) -D VALUE_TYPE=$(VALUE_TYPE)
 
-.PHONY: gpu-preprocess-test gpu-preprocess-test-run
+.PHONY: gpu-preprocess-test gpu-preprocess-test-run \
+	dmma-dynamic-test dmma-dynamic-test-run \
+	tile2csr-restore-test tile2csr-restore-test-run \
+	dmma-wide-test dmma-wide-test-run
 
 gpu-preprocess-test:
 	$(NVCC) $(NVCC_FLAGS) $(GENCODE_FLAGS) -Xcompiler -fopenmp -Xcompiler -mfma ../tests/gpu_dmma_tiles_test.cu -o $(GPU_PREPROCESS_TEST_TARGET) $(INCLUDES) $(LIBS) $(OPTIONS) -D VALUE_TYPE=$(VALUE_TYPE)
 
 gpu-preprocess-test-run: gpu-preprocess-test
 	./$(GPU_PREPROCESS_TEST_TARGET) --device $(or $(DEVICE),0)
+
+dmma-dynamic-test:
+	$(NVCC) $(NVCC_FLAGS) $(GENCODE_FLAGS) -Xcompiler -fopenmp -Xcompiler -mfma ../tests/dmma_dynamic_b_test.cu -o $(DMMA_DYNAMIC_TEST_TARGET) $(INCLUDES) $(LIBS) $(OPTIONS) -D VALUE_TYPE=$(VALUE_TYPE)
+
+dmma-dynamic-test-run: dmma-dynamic-test
+	./$(DMMA_DYNAMIC_TEST_TARGET)
+
+tile2csr-restore-test:
+	$(NVCC) $(NVCC_FLAGS) $(GENCODE_FLAGS) -Xcompiler -fopenmp -Xcompiler -mfma ../tests/tile2csr_restore_test.cu -o $(TILE2CSR_RESTORE_TEST_TARGET) $(INCLUDES) $(LIBS) $(OPTIONS) -D VALUE_TYPE=$(VALUE_TYPE)
+
+tile2csr-restore-test-run: tile2csr-restore-test
+	./$(TILE2CSR_RESTORE_TEST_TARGET)
+
+dmma-wide-test:
+	$(NVCC) $(NVCC_FLAGS) $(GENCODE_FLAGS) -Xcompiler -fopenmp -Xcompiler -mfma ../tests/dmma_wide_mask_spa_test.cu -o $(DMMA_WIDE_TEST_TARGET) $(INCLUDES) $(LIBS) $(OPTIONS) -D VALUE_TYPE=$(VALUE_TYPE)
+
+dmma-wide-test-run: dmma-wide-test
+	./$(DMMA_WIDE_TEST_TARGET)

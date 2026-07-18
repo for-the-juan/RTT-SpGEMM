@@ -53,7 +53,33 @@ int spgemm_cu (         const int             mA,
     return validation_status;
 }
 
-/* Validate against cuSPARSE while borrowing the production device CSR. */
+/* Validate a general A*B product while borrowing both production device CSRs. */
+static inline int spgemm_cu_device_ab(
+    const int mA, const int nA, const int nnzA,
+    const MAT_PTR_TYPE *d_csrRowPtrA, const int *d_csrColIdxA,
+    const MAT_VAL_TYPE *d_csrValA,
+    const int mB, const int nB, const int nnzB,
+    const MAT_PTR_TYPE *d_csrRowPtrB, const int *d_csrColIdxB,
+    const MAT_VAL_TYPE *d_csrValB,
+    const int mC, const int nC, const MAT_PTR_TYPE nnzC_golden,
+    const MAT_PTR_TYPE *csrRowPtrC_golden,
+    const int *csrColIdxC_golden, const bool check_result,
+    unsigned long long int nnzCub, unsigned long long int *nnzC,
+    double *compression_rate, double *time_segmerge,
+    double *gflops_segmerge)
+{
+    printf("\n--------------- SpGEMM (using cuSPARSE) ---------------\n");
+    const int validation_status = spgemm_cusparse_device_ab(
+        mA, nA, nnzA, d_csrRowPtrA, d_csrColIdxA, d_csrValA,
+        mB, nB, nnzB, d_csrRowPtrB, d_csrColIdxB, d_csrValB,
+        mC, nC, nnzC_golden, csrRowPtrC_golden, csrColIdxC_golden,
+        check_result, nnzCub, nnzC, compression_rate, time_segmerge,
+        gflops_segmerge);
+    printf("---------------------------------------------------------------\n");
+    return validation_status;
+}
+
+/* Validate AA/AAT while borrowing the production device CSR for A. */
 static inline int spgemm_cu_device(
     const int mA, const int nA, const int nnzA,
     const MAT_PTR_TYPE *d_csrRowPtrA, const int *d_csrColIdxA,
@@ -74,4 +100,3 @@ static inline int spgemm_cu_device(
     printf("---------------------------------------------------------------\n");
     return validation_status;
 }
-
