@@ -153,29 +153,30 @@ public:
         const std::size_t bytes = static_cast<std::size_t>(count) * sizeof(T);
         auto &cached = cache();
         std::size_t best = cached.size();
-        for (std::size_t index = 0; index < cached.size(); ++index)
-            if (cached[index].second >= count &&
-                (best == cached.size() ||
-                 cached[index].second < cached[best].second))
-                best = index;
-        if (best != cached.size())
+        if (cache_enabled())
         {
-            pointer_ = cached[best].first;
-            capacity_ = cached[best].second;
-            cached[best] = cached.back();
-            cached.pop_back();
-            count_ = count;
-            return true;
+            for (std::size_t index = 0; index < cached.size(); ++index)
+                if (cached[index].second >= count &&
+                    (best == cached.size() ||
+                     cached[index].second < cached[best].second))
+                    best = index;
+            if (best != cached.size())
+            {
+                pointer_ = cached[best].first;
+                capacity_ = cached[best].second;
+                cached[best] = cached.back();
+                cached.pop_back();
+                count_ = count;
+                return true;
+            }
         }
-        /* Tile/Flex accounts allocation separately from symbolic.  More
-         * importantly, a synchronous cudaMalloc/cudaFree pair here forced a
-         * device-wide allocation barrier on every SpGEMM iteration.  All
-         * Super16 work currently runs on the legacy default stream, so use
-         * CUDA's stream-ordered pool: the two warmups populate the pool and
-         * timed iterations reuse the same storage without changing any
-         * numeric buffer or kernel. */
-        cudaError_t status = cudaMallocAsync(
-            reinterpret_cast<void **>(&pointer_), bytes, nullptr);
+        /* New blocks use the stream-ordered pool; the fixed-capacity host
+         * cache above removes the corruptible std::vector metadata while
+         * retaining the warmup-populated fast path. */
+        cudaError_t status = cache_enabled()
+            ? cudaMallocAsync(reinterpret_cast<void **>(&pointer_), bytes,
+                              nullptr)
+            : cudaMalloc(reinterpret_cast<void **>(&pointer_), bytes);
         if (status == cudaErrorNotSupported)
         {
             (void)cudaGetLastError();
@@ -202,11 +203,13 @@ public:
              * of simultaneously live arrays of each element type.  Keep
              * those allocations across iterations, but cap the cache so a
              * matrix sequence cannot retain unbounded historical storage. */
-            if (cached.size() < 16)
+            if (cache_enabled() && cached.size() < 16)
                 cached.emplace_back(pointer_, capacity_);
             else
             {
-                cudaError_t status = cudaFreeAsync(pointer_, nullptr);
+                cudaError_t status = cache_enabled()
+                    ? cudaFreeAsync(pointer_, nullptr)
+                    : cudaFree(pointer_);
                 if (status == cudaErrorNotSupported)
                 {
                     (void)cudaGetLastError();
@@ -236,10 +239,34 @@ public:
     }
 
 private:
-    using CacheEntry = std::pair<T *, std::uint64_t>;
-    static std::vector<CacheEntry> &cache()
+    static bool cache_enabled()
     {
-        static std::vector<CacheEntry> buffers;
+        const char *value = std::getenv("RTT_SUPER16_BUFFER_CACHE");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }
+
+    using CacheEntry = std::pair<T *, std::uint64_t>;
+    struct FixedCache
+    {
+        CacheEntry entries[16]{};
+        std::size_t used = 0;
+
+        std::size_t size() const noexcept { return used; }
+        CacheEntry &operator[](std::size_t index) noexcept
+        {
+            return entries[index];
+        }
+        CacheEntry &back() noexcept { return entries[used - 1]; }
+        void pop_back() noexcept { --used; }
+        void emplace_back(T *pointer, std::uint64_t capacity) noexcept
+        {
+            entries[used++] = CacheEntry(pointer, capacity);
+        }
+    };
+
+    static FixedCache &cache()
+    {
+        static FixedCache buffers;
         return buffers;
     }
     T *pointer_ = nullptr;
@@ -486,6 +513,7 @@ public:
         cols.reset();
         masks.reset();
         nnz_offsets.reset();
+        numeric_work.reset();
     }
 
     int leaf_row_count = 0;
@@ -502,6 +530,10 @@ public:
     DeviceBuffer<std::uint64_t> masks;
     /* Per-tile popcounts before scan, numeric value offsets after scan. */
     DeviceBuffer<int> nnz_offsets;
+    /* Dense/bitmask-aware scheduling estimate aligned one-to-one with the
+     * final native C tile arrays.  It is metadata only; numeric continues to
+     * decode the original hybrid A/B payloads. */
+    DeviceBuffer<std::uint64_t> numeric_work;
 };
 
 /* Parent-level symbolic result.  Native 8x8 leaf finalization is deliberately
@@ -2702,6 +2734,64 @@ __global__ void fill_native_output_kernel(
     }
 }
 
+/* Preserve the exact merge counts already needed by the production tail
+ * scheduler.  High 32 bits are comparisons/scans and low 32 bits are
+ * matches.  row_ptr only locates the A/B tile lists; neither operand payload
+ * is converted away from its dense/bitmask representation. */
+__global__ void build_native_numeric_work_kernel(
+    DmmaDeviceTiles a, DmmaDeviceTiles b, int task_count,
+    const int *__restrict__ output_rows,
+    const int *__restrict__ output_cols,
+    const std::uint64_t *__restrict__ output_masks,
+    std::uint64_t *__restrict__ output_work, int *error)
+{
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t task =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         task < static_cast<std::uint64_t>(task_count); task += stride)
+    {
+        const int row = output_rows[task];
+        const int col = output_cols[task];
+        if (row < 0 || row >= a.tile_row_count || col < 0 ||
+            col >= b.tile_col_count)
+        {
+            output_work[task] = 0;
+            atomicCAS(error, 0, 72);
+            continue;
+        }
+        int pa = a.tile_row_ptr[row];
+        int pb = b.tile_col_ptr[col];
+        const int a_end = a.tile_row_ptr[row + 1];
+        const int b_end = b.tile_col_ptr[col + 1];
+        std::uint32_t scans = 0;
+        std::uint32_t matches = 0;
+        while (pa < a_end && pb < b_end)
+        {
+            if (scans != UINT_MAX)
+                ++scans;
+            const int ka = a.tile_col_idx[pa];
+            const int kb = b.tile_row_idx[pb];
+            if (ka < kb)
+            {
+                ++pa;
+                continue;
+            }
+            if (ka > kb)
+            {
+                ++pb;
+                continue;
+            }
+            if (matches != UINT_MAX)
+                ++matches;
+            ++pa;
+            ++pb;
+        }
+        output_work[task] = (static_cast<std::uint64_t>(scans) << 32) |
+                            static_cast<std::uint64_t>(matches);
+    }
+}
+
 __device__ __forceinline__ std::uint32_t diagnostic_bin(
     std::uint32_t coordinate, std::uint32_t extent, std::uint32_t bins)
 {
@@ -3774,10 +3864,11 @@ inline bool build_candidates(const DeviceIndexView &a,
                              CandidateState *output,
                              SymbolicMetrics *metrics = nullptr)
 {
-    /* Match TileSpGEMM/FlexSpGEMM step1.  Their shared-memory SPA covers up
-     * to 512 words (16384 parent columns).  Wider inputs use the bounded
-     * row-batched SPA until the row-binned wide path is selected; unlike the
-     * retired global page hash this has no fixed-cardinality failure mode. */
+    /* Match TileSpGEMM/FlexSpGEMM step1 for matrices covered by their
+     * shared-memory SPA.  Keep the measured wide-sort baseline for wider
+     * inputs until the row-binned wide kernel is ready: the row-batch bitmap
+     * prototype repeatedly scanned the 16K-column batches and regressed
+     * great-britain_osm by more than an order of magnitude. */
     if (b.parent_col_count <= kTileSpaColumnLimit)
         return build_candidates_tile_spa(a, b, stream, output, metrics);
     return build_candidates_wide_sort(a, b, stream, output, metrics);
@@ -4343,7 +4434,7 @@ inline bool finalize_native_output(
     const DmmaDeviceTiles &a_leaf, const DmmaDeviceTiles &b_leaf,
     const DeviceIndexView &a, const DeviceIndexView &b,
     const CandidateState &candidates, const ExactState &exact,
-    cudaStream_t stream, NativeOutput *output,
+    cudaStream_t stream, bool collect_numeric_work, NativeOutput *output,
     SymbolicMetrics *metrics = nullptr)
 {
     if (output == nullptr)
@@ -4443,6 +4534,9 @@ inline bool finalize_native_output(
                                "allocate Super16 native output masks") ||
         !result.nnz_offsets.allocate(
             tile_count + 1, "allocate Super16 native nnz offsets") ||
+        (collect_numeric_work &&
+         !result.numeric_work.allocate(
+             tile_count, "allocate Super16 native numeric work")) ||
         !detail::cuda_ok(cudaMemsetAsync(
                              result.nnz_offsets.get(), 0,
                              (static_cast<std::size_t>(tile_count) + 1) *
@@ -4472,6 +4566,18 @@ inline bool finalize_native_output(
                          "launch Super16 native output fill") ||
         !detail::sync_and_read_error(stream, error.get(),
                                      "fill Super16 native output"))
+        return false;
+
+    if (collect_numeric_work && tile_count > 0)
+        detail::build_native_numeric_work_kernel
+            <<<detail::build_blocks(tile_count), kBuildThreads, 0, stream>>>(
+                a_leaf, b_leaf, result.tile_count, result.rows.get(),
+                result.cols.get(), result.masks.get(),
+                result.numeric_work.get(), error.get());
+    if (!detail::cuda_ok(cudaGetLastError(),
+                         "launch Super16 numeric-work build") ||
+        !detail::sync_and_read_error(stream, error.get(),
+                                     "build Super16 numeric-work metadata"))
         return false;
 
     unsigned long long nnz_wide = 0;
@@ -4522,7 +4628,8 @@ inline bool finalize_native_output(
     if (metrics != nullptr)
     {
         metrics->final_leaf_c_tiles = tile_count;
-        metrics->scratch_bytes += child_local_offsets.bytes();
+        metrics->scratch_bytes += child_local_offsets.bytes() +
+                                  result.numeric_work.bytes();
         metrics->finalize_ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - begin_time)
@@ -4539,7 +4646,8 @@ inline bool run_parent_symbolic(const DmmaDeviceTiles &a_leaf,
                                 const DmmaDeviceTiles &b_leaf,
                                 const DeviceIndexView &a,
                                 const DeviceIndexView &b,
-                                cudaStream_t stream, SymbolicOutput *output)
+                                cudaStream_t stream, SymbolicOutput *output,
+                                bool collect_numeric_work = false)
 {
     const auto begin_time = std::chrono::steady_clock::now();
     if (output == nullptr)
@@ -4565,7 +4673,8 @@ inline bool run_parent_symbolic(const DmmaDeviceTiles &a_leaf,
         }
     }
     if (!finalize_native_output(a_leaf, b_leaf, a, b, result.candidates,
-                                result.exact, stream, &result.native,
+                                result.exact, stream, collect_numeric_work,
+                                &result.native,
                                 &result.metrics))
         return false;
     result.metrics.symbolic_ms =

@@ -11,6 +11,9 @@
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
+#include <thrust/functional.h>
 
 #include <climits>
 #include <algorithm>
@@ -663,6 +666,11 @@ struct DmmaSplitAsyncState;
 struct DmmaNumericScheduleConfig
 {
     bool tileflex16_symbolic = false;
+    /* Cost-balanced is a direct-numeric scheduling wrapper.  It reorders
+     * independent final C tasks by symbolic work and feeds the unchanged
+     * hybrid-payload Tensor Core primitive from a persistent warp queue. */
+    bool cost_balanced = false;
+    int cost_workers_per_sm = 4;
     DmmaNumericScheduleMode mode = DMMA_SCHEDULE_DIRECT;
     DmmaDirectNumericLayout direct_numeric_layout =
         DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
@@ -791,6 +799,10 @@ struct DmmaSpGemmStats
      * compatibility; scheduler_device_ms spans the default-stream metadata
      * chain through its ready event and is the device-visible Core delay. */
     double scheduler_ms = 0.0;
+    bool cost_balanced_requested = false;
+    bool cost_balanced_used = false;
+    int cost_worker_blocks = 0;
+    std::size_t cost_metadata_bytes = 0;
     double scheduler_device_ms = 0.0;
     /* Device time of the cheap upper-bound filter plus the exact-count
      * replay over maybe IDs.  The direct exact-mask kernel is excluded. */
@@ -2572,6 +2584,41 @@ struct DmmaTailAppendState
     int overflow = 0;
 };
 
+/* B-values iterations preserve both operand structures, so the exact heavy
+ * set is invariant.  Keep a compact host copy between calls; cache hits avoid
+ * rebuilding an output-sized count buffer and avoid reserving the configured
+ * worst-case record capacity.  Numeric outputs and partial accumulators are
+ * never cached. */
+struct DmmaTileFlexTailHostCache
+{
+    int device = -1;
+    const int *a_row_ptr = nullptr;
+    const int *a_col_idx = nullptr;
+    const int *b_row_ptr = nullptr;
+    const int *b_col_idx = nullptr;
+    int output_tiles = -1;
+    double scan = 0.0;
+    double match = 0.0;
+    double threshold = 0.0;
+    double chunk_target = 0.0;
+    int max_chunks = 0;
+    std::vector<DmmaTailRecord> records;
+    bool valid = false;
+
+    bool matches(const DmmaDeviceTiles &a, const DmmaDeviceTiles &b,
+                 int current_device, const DmmaNumericScheduleConfig &schedule,
+                 double resolved_target) const
+    {
+        return valid && device == current_device &&
+               a_row_ptr == a.tile_row_ptr && a_col_idx == a.tile_col_idx &&
+               b_row_ptr == b.tile_row_ptr && b_col_idx == b.tile_col_idx &&
+               scan == schedule.cost.scan && match == schedule.cost.match &&
+               threshold == schedule.split_threshold &&
+               chunk_target == resolved_target &&
+               max_chunks == schedule.max_chunks;
+    }
+};
+
 /* Reserve one bounded sparse-tail record.  Before overflow, each successful
  * caller receives a unique slot in [0, capacity).  The first excess caller
  * raises overflow and all racing excess increments converge to capacity+1;
@@ -2636,6 +2683,48 @@ dmma_tail_chunk_count_from_counts(
     if (chunks > scans)
         chunks = scans;
     return chunks >= 2 ? chunks : 0;
+}
+
+/* TileFlex step2 has already compacted final 8x8 C tasks.  Decode the exact
+ * merge counts collected during its native finalize and materialize only the
+ * sparse heavy set expected by the pre-16x16 tail scheduler.  This replaces
+ * the legacy candidate-ID map pass; record IDs are born in final-output
+ * space, so the numeric light/heavy partition remains unchanged. */
+__global__ void dmma_tileflex_build_tail_records_kernel(
+    int task_count, const std::uint64_t *__restrict__ packed_counts,
+    float scan_cost, float match_cost, float admission_threshold,
+    float chunk_target, int max_chunks,
+    DmmaTailRecord *__restrict__ tail_records, int tail_capacity,
+    DmmaTailAppendState *__restrict__ tail_state)
+{
+    const int task = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (task >= task_count)
+        return;
+    const std::uint64_t packed = packed_counts[task];
+    const std::uint32_t scans_wide = static_cast<std::uint32_t>(packed >> 32);
+    const std::uint32_t matches_wide = static_cast<std::uint32_t>(packed);
+    if (scans_wide > static_cast<std::uint32_t>(INT_MAX) ||
+        matches_wide > scans_wide)
+    {
+        atomicExch(&tail_state->overflow, 1);
+        return;
+    }
+    const int scans = static_cast<int>(scans_wide);
+    const int matches = static_cast<int>(matches_wide);
+    const int chunks = dmma_tail_chunk_count_from_counts(
+        scans, matches, scan_cost, match_cost, admission_threshold,
+        chunk_target, max_chunks);
+    if (chunks <= 0)
+        return;
+    const int slot = dmma_tail_try_reserve_record(tail_state, tail_capacity);
+    if (slot < 0)
+        return;
+    DmmaTailRecord record;
+    record.id = task;
+    record.scans = scans;
+    record.matches = matches;
+    record.chunks = chunks;
+    tail_records[slot] = record;
 }
 
 /* Source-compatible coupled-threshold form retained for host tests and
@@ -5070,6 +5159,51 @@ __device__ __forceinline__ void dmma_numeric_regular_task(
 #endif
 }
 
+/* Cost-balanced wrapper around the unchanged regular numeric primitive.
+ * Symbolic supplies a task permutation ordered by predicted hybrid-payload
+ * work.  Each warp independently dequeues one task, removing the four-task
+ * CTA convoy of the uniform grid while preserving all A/B decoding and MMA
+ * instructions inside dmma_numeric_regular_task. */
+__global__ void dmma_numeric_cost_queue_kernel(
+    DmmaDeviceTiles a, DmmaDeviceTiles b, int output_tile_count,
+    const int *__restrict__ task_order, int *__restrict__ queue_head,
+    const int *__restrict__ output_rows, const int *__restrict__ output_cols,
+    const uint64_t *__restrict__ output_masks,
+    const int *__restrict__ output_offsets,
+    unsigned char *__restrict__ output_row_ptr,
+    unsigned char *__restrict__ output_col_idx,
+    MAT_VAL_TYPE *__restrict__ output_values)
+{
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int local_warp = threadIdx.x / WARP_SIZE;
+    __shared__ MAT_VAL_TYPE
+        shared_a[DMMA_WARPS_PER_BLOCK * DMMA_INPUT_ELEMS];
+    __shared__ MAT_VAL_TYPE
+        shared_b[DMMA_WARPS_PER_BLOCK * DMMA_INPUT_ELEMS];
+    __shared__ MAT_VAL_TYPE
+        shared_c[DMMA_WARPS_PER_BLOCK * DMMA_OUTPUT_ELEMS];
+    MAT_VAL_TYPE *tile_a_values =
+        shared_a + local_warp * DMMA_INPUT_ELEMS;
+    MAT_VAL_TYPE *tile_b_values =
+        shared_b + local_warp * DMMA_INPUT_ELEMS;
+    MAT_VAL_TYPE *tile_c_values =
+        shared_c + local_warp * DMMA_OUTPUT_ELEMS;
+    while (true)
+    {
+        int position = 0;
+        if (lane == 0)
+            position = atomicAdd(queue_head, 1);
+        position = __shfl_sync(0xffffffffu, position, 0);
+        if (position >= output_tile_count)
+            break;
+        const int task = task_order[position];
+        dmma_numeric_regular_task(
+            a, b, output_tile_count, output_rows, output_cols, output_masks,
+            output_offsets, output_row_ptr, output_col_idx, output_values,
+            task, lane, tile_a_values, tile_b_values, tile_c_values);
+    }
+}
+
 __device__ __forceinline__ void dmma_numeric_low_fill_sparse_task(
     DmmaDeviceTiles a, DmmaDeviceTiles b, int task, int tile_row,
     int tile_col, int lane, uint64_t mask, int output_begin,
@@ -6649,6 +6783,14 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
          schedule.row_queue_batch != 1) ||
         (schedule.row_dynamic_auto &&
          schedule.mode != DMMA_SCHEDULE_DIRECT) ||
+        (schedule.cost_balanced &&
+         (!schedule.tileflex16_symbolic ||
+          schedule.mode != DMMA_SCHEDULE_DIRECT ||
+          schedule.row_dynamic_auto ||
+          schedule.direct_numeric_layout !=
+              DMMA_DIRECT_NUMERIC_TILE_DYNAMIC)) ||
+        schedule.cost_workers_per_sm < 1 ||
+        schedule.cost_workers_per_sm > 16 ||
         !std::isfinite(schedule.row_dynamic_threshold) ||
         schedule.row_dynamic_threshold < 1.0 ||
         !(schedule.split_threshold > 0.0) ||
@@ -6751,6 +6893,7 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
         schedule.symbolic_critical_waves < 1)
         return false;
     stats->schedule_mode = schedule.mode;
+    stats->cost_balanced_requested = schedule.cost_balanced;
     stats->direct_numeric_layout = schedule.direct_numeric_layout;
     stats->row_dynamic_queue_batch = schedule.row_queue_batch;
     stats->row_gate_requested = schedule.row_dynamic_auto;
@@ -6855,6 +6998,11 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     uint64_t *d_output_masks = nullptr;
     int *d_output_nnz = nullptr;
     int *d_output_row_ptr = nullptr;
+    std::uint64_t *d_output_numeric_work = nullptr;
+    std::uint64_t *d_cost_sort_keys = nullptr;
+    int *d_cost_task_order = nullptr;
+    int *d_cost_queue_head = nullptr;
+    int cost_worker_blocks = 0;
     int output_tile_count = 0;
     int output_nnz = 0;
     rtt::super16::SymbolicOutput super16_output;
@@ -6913,7 +7061,7 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     bool row_dynamic_requested =
         use_direct_numeric && !row_dynamic_auto_requested &&
         schedule.direct_numeric_layout == DMMA_DIRECT_NUMERIC_ROW_DYNAMIC;
-    const bool row_worker_requested =
+    bool row_worker_requested =
         row_dynamic_auto_requested || row_static_requested ||
         row_dynamic_requested;
     const bool flat_grid_requested =
@@ -7033,32 +7181,55 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     gettimeofday(&total_begin, nullptr);
     if (schedule.tileflex16_symbolic)
     {
-        /* Until the exact work metadata is wired into every split scheduler,
-         * fail closed outside the frozen direct/tile-dynamic contract. */
-        if (schedule.mode != DMMA_SCHEDULE_DIRECT ||
-            schedule.direct_numeric_layout !=
-                DMMA_DIRECT_NUMERIC_TILE_DYNAMIC ||
+        /* TileFlex produces the same final 8x8 task ABI used by the original
+         * numeric path.  Direct and the two audited sparse-heavy schedulers
+         * are supported; broader split/unified experiments remain closed. */
+        if ((schedule.mode != DMMA_SCHEDULE_DIRECT &&
+             schedule.mode != DMMA_SCHEDULE_TILE_TAIL_QUEUE &&
+             schedule.mode != DMMA_SCHEDULE_TILE_EARLY_SPLIT) ||
             schedule.light_policy != DMMA_LIGHT_STATIC ||
-            schedule.symbolic_admission != DMMA_SYMBOLIC_ADMISSION_SEPARATE ||
+            (schedule.mode == DMMA_SCHEDULE_DIRECT &&
+             schedule.symbolic_admission !=
+                 DMMA_SYMBOLIC_ADMISSION_SEPARATE) ||
             schedule.collect_symbolic_load || schedule.exact_forward_spa ||
             schedule.low_fill_exact_tile)
         {
             std::fprintf(stderr,
-                         "tileflex16 symbolic currently requires direct/"
-                         "tile-dynamic/static/separate numeric contract.\n");
+                         "tileflex16 symbolic supports direct or audited "
+                         "tile-tail/early-split with static light policy.\n");
             goto failure;
         }
         static DmmaSuper16IndexCache cache;
+        static DmmaTileFlexTailHostCache tail_cache;
+        const bool tileflex_tail_cache_enabled = [] {
+            const char *value = std::getenv("RTT_TILEFLEX_TAIL_CACHE");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        int tileflex_device = -1;
+        const bool tail_cache_device_valid =
+            dmma_cuda_ok(cudaGetDevice(&tileflex_device),
+                         "read TileFlex tail-cache device");
+        if (!tail_cache_device_valid)
+            goto failure;
+        bool tileflex_tail_cache_hit =
+            tileflex_tail_cache_enabled && collect_sparse_tail_records &&
+            tail_cache.matches(a, b, tileflex_device, schedule,
+                               resolved_chunk_target);
         if (!cache.prepare(a, b, nullptr) ||
             !rtt::super16::run_parent_symbolic(
                 a, b, cache.a_index.view(), cache.b_index.view(), nullptr,
-                &super16_output))
+                &super16_output,
+                schedule.cost_balanced ||
+                    (collect_sparse_tail_records &&
+                     !tileflex_tail_cache_hit)))
             goto failure;
         d_output_row_ptr = super16_output.native.row_ptr.release();
         d_output_rows = super16_output.native.rows.release();
         d_output_cols = super16_output.native.cols.release();
         d_output_masks = super16_output.native.masks.release();
         d_output_nnz = super16_output.native.nnz_offsets.release();
+        d_output_numeric_work =
+            super16_output.native.numeric_work.release();
         output_tile_count = super16_output.native.tile_count;
         output_nnz = super16_output.native.nnz;
         stats->candidate_ms = super16_output.metrics.candidate_queue_ms;
@@ -7070,6 +7241,189 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
             super16_output.metrics.parent_c_candidates;
         stats->output_tiles = output_tile_count;
         stats->output_nnz = output_nnz;
+        if (collect_sparse_tail_records && output_tile_count > 0)
+        {
+            timeval tail_begin{}, tail_end{};
+            gettimeofday(&tail_begin, nullptr);
+            if (tileflex_tail_cache_hit &&
+                tail_cache.output_tiles != output_tile_count)
+                tileflex_tail_cache_hit = false;
+            /* A non-forced run is rejected as soon as the exact heavy
+             * fraction exceeds max_heavy_fraction.  Reserving one record
+             * beyond that admissible count is sufficient to prove the gate
+             * must fall back, and avoids the old O(|C_tiles|)/1M-record
+             * speculative allocation on every single-shot call. */
+            const double admissible_records_wide = std::floor(
+                static_cast<double>(output_tile_count) *
+                schedule.max_heavy_fraction);
+            const int admissible_records = static_cast<int>(std::min(
+                admissible_records_wide,
+                static_cast<double>(std::numeric_limits<int>::max() - 1)));
+            const int gate_detection_capacity = schedule.force_tail_split
+                ? output_tile_count
+                : std::min(output_tile_count, admissible_records + 1);
+            tail_record_capacity = std::min(
+                gate_detection_capacity, schedule.tail_record_capacity);
+            const std::size_t capacity_record_bytes =
+                static_cast<std::size_t>(tail_record_capacity) *
+                sizeof(DmmaTailRecord);
+            const std::size_t cached_record_bytes =
+                tileflex_tail_cache_hit
+                    ? tail_cache.records.size() * sizeof(DmmaTailRecord)
+                    : 0;
+            if (tail_record_capacity <= 0 ||
+                (!tileflex_tail_cache_hit &&
+                 d_output_numeric_work == nullptr) ||
+                !dmma_cuda_ok(cudaMalloc(
+                                  reinterpret_cast<void **>(&d_tail_records),
+                                  tileflex_tail_cache_hit
+                                      ? std::max<std::size_t>(
+                                            cached_record_bytes, 1)
+                                      : capacity_record_bytes),
+                              "allocate TileFlex tail records"))
+                goto symbolic_failure;
+            if (tileflex_tail_cache_hit)
+            {
+                tail_record_count =
+                    static_cast<int>(tail_cache.records.size());
+                if (cached_record_bytes > 0 &&
+                    !dmma_cuda_ok(cudaMemcpy(
+                                      d_tail_records,
+                                      tail_cache.records.data(),
+                                      cached_record_bytes,
+                                      cudaMemcpyHostToDevice),
+                                  "upload cached TileFlex tail records"))
+                    goto symbolic_failure;
+                tail_record_overflow = false;
+                if (admission_events_ready &&
+                    (!dmma_cuda_ok(cudaEventRecord(
+                                       split_async.admission_filter_start, 0),
+                                   "record cached TileFlex filter start") ||
+                     !dmma_cuda_ok(cudaEventRecord(
+                                       split_async.admission_filter_stop, 0),
+                                   "record cached TileFlex filter stop") ||
+                     !dmma_cuda_ok(cudaEventRecord(
+                                       split_async.admission_count_start, 0),
+                                   "record cached TileFlex count start") ||
+                     !dmma_cuda_ok(cudaEventRecord(
+                                       split_async.admission_count_stop, 0),
+                                   "record cached TileFlex count stop")))
+                    goto symbolic_failure;
+                admission_count_event_recorded = admission_events_ready;
+            }
+            else if (!dmma_cuda_ok(cudaMalloc(
+                                  reinterpret_cast<void **>(
+                                      &d_tail_append_state),
+                                  sizeof(DmmaTailAppendState)),
+                              "allocate TileFlex tail state") ||
+                !dmma_cuda_ok(cudaMemset(d_tail_append_state, 0,
+                                         sizeof(DmmaTailAppendState)),
+                              "clear TileFlex tail state"))
+                goto symbolic_failure;
+            if (!tileflex_tail_cache_hit)
+            {
+            unsigned int tail_blocks = 0;
+            if (!dmma_launch_blocks(
+                    static_cast<std::size_t>(output_tile_count), 256,
+                    &tail_blocks, "TileFlex tail admission"))
+                goto symbolic_failure;
+            /* TileFlex needs no loose maybe-ID pass, but the borrowed split
+             * context's timing ABI still requires a valid filter interval. */
+            if (admission_events_ready &&
+                (!dmma_cuda_ok(cudaEventRecord(
+                                   split_async.admission_filter_start, 0),
+                               "record TileFlex empty filter start") ||
+                 !dmma_cuda_ok(cudaEventRecord(
+                                   split_async.admission_filter_stop, 0),
+                               "record TileFlex empty filter stop") ||
+                 !dmma_cuda_ok(cudaEventRecord(
+                                   split_async.admission_count_start, 0),
+                               "record TileFlex tail admission start")))
+                goto symbolic_failure;
+            dmma_tileflex_build_tail_records_kernel<<<tail_blocks, 256>>>(
+                output_tile_count, d_output_numeric_work,
+                static_cast<float>(schedule.cost.scan),
+                static_cast<float>(schedule.cost.match),
+                static_cast<float>(schedule.split_threshold),
+                static_cast<float>(resolved_chunk_target),
+                schedule.max_chunks, d_tail_records, tail_record_capacity,
+                d_tail_append_state);
+            if (admission_events_ready &&
+                !dmma_cuda_ok(cudaEventRecord(
+                                  split_async.admission_count_stop, 0),
+                              "record TileFlex tail admission stop"))
+                goto symbolic_failure;
+            admission_count_event_recorded = admission_events_ready;
+            DmmaTailAppendState tail_state{};
+            if (!dmma_cuda_ok(cudaGetLastError(),
+                              "launch TileFlex tail admission") ||
+                !dmma_cuda_ok(cudaMemcpy(
+                                  &tail_state, d_tail_append_state,
+                                  sizeof(tail_state), cudaMemcpyDeviceToHost),
+                              "read TileFlex tail state"))
+                goto symbolic_failure;
+            tail_record_count = tail_state.count;
+            tail_record_overflow = tail_state.overflow != 0 ||
+                                   tail_record_count > tail_record_capacity;
+            if (tileflex_tail_cache_enabled && !tail_record_overflow)
+            {
+                tail_cache.records.resize(
+                    static_cast<std::size_t>(tail_record_count));
+                const std::size_t used_record_bytes =
+                    tail_cache.records.size() * sizeof(DmmaTailRecord);
+                if (used_record_bytes > 0 &&
+                    !dmma_cuda_ok(cudaMemcpy(
+                                      tail_cache.records.data(),
+                                      d_tail_records, used_record_bytes,
+                                      cudaMemcpyDeviceToHost),
+                                  "cache TileFlex tail records"))
+                    goto symbolic_failure;
+                tail_cache.device = tileflex_device;
+                tail_cache.a_row_ptr = a.tile_row_ptr;
+                tail_cache.a_col_idx = a.tile_col_idx;
+                tail_cache.b_row_ptr = b.tile_row_ptr;
+                tail_cache.b_col_idx = b.tile_col_idx;
+                tail_cache.output_tiles = output_tile_count;
+                tail_cache.scan = schedule.cost.scan;
+                tail_cache.match = schedule.cost.match;
+                tail_cache.threshold = schedule.split_threshold;
+                tail_cache.chunk_target = resolved_chunk_target;
+                tail_cache.max_chunks = schedule.max_chunks;
+                tail_cache.valid = true;
+            }
+            }
+            stats->tail_record_capacity = tail_record_capacity;
+            stats->tail_record_count = tail_record_count;
+            stats->tail_record_overflow = tail_record_overflow;
+            stats->tail_record_count_is_lower_bound = tail_record_overflow;
+            stats->tail_record_fraction =
+                static_cast<double>(tail_record_count) / output_tile_count;
+            stats->symbolic_task_count_bytes =
+                (tileflex_tail_cache_hit ? cached_record_bytes
+                                         : capacity_record_bytes) +
+                (tileflex_tail_cache_hit ? 0
+                                         : sizeof(DmmaTailAppendState)) +
+                (tileflex_tail_cache_hit
+                     ? 0
+                     : static_cast<std::size_t>(output_tile_count) *
+                           sizeof(std::uint64_t));
+            if (tail_record_overflow)
+                stats->tail_gate_reason = DMMA_TAIL_GATE_RECORD_OVERFLOW;
+            else if (tail_record_count == 0)
+                stats->tail_gate_reason = DMMA_TAIL_GATE_ZERO_HEAVY;
+            else if (!schedule.force_tail_split &&
+                     stats->tail_record_fraction >
+                         schedule.max_heavy_fraction)
+                stats->tail_gate_reason = DMMA_TAIL_GATE_HEAVY_FRACTION;
+            else
+            {
+                stats->tail_gate_reason = DMMA_TAIL_GATE_ENABLED;
+                sparse_tail_records_ready = true;
+            }
+            gettimeofday(&tail_end, nullptr);
+            stats->symbolic_finalize_ms +=
+                dmma_elapsed_ms(tail_begin, tail_end);
+        }
         goto numeric_phase;
     }
     gettimeofday(&begin, nullptr);
@@ -8947,9 +9301,24 @@ numeric_phase:
             dmma_row_gate_features(
                 gate_summary, a.tile_row_count, row_worker_count,
                 output_tile_count);
-        const bool gate_dynamic = dmma_row_gate_select_dynamic(
-            gate_summary, gate_features,
-            schedule.row_dynamic_threshold);
+        /* A row worker serializes all C tiles belonging to the claimed row.
+         * It is therefore only a viable granularity for short rows.  The
+         * imbalance-only gate selected TSOPF (341 C tiles/row on average)
+         * and changed numeric from 3.6 ms to 44.5 ms.  Fail closed to the
+         * original tile-dynamic kernel when a row contains more than one
+         * eight-warp scheduling window on average; long-row tails need tile
+         * splitting, not whole-row ownership. */
+        constexpr double kRowDynamicMaximumMeanTiles = 32.0;
+        const double mean_tiles_per_row =
+            gate_summary.rows > 0
+                ? static_cast<double>(gate_summary.exact_tiles) /
+                      static_cast<double>(gate_summary.rows)
+                : 0.0;
+        const bool gate_dynamic =
+            mean_tiles_per_row <= kRowDynamicMaximumMeanTiles &&
+            dmma_row_gate_select_dynamic(
+                gate_summary, gate_features,
+                schedule.row_dynamic_threshold);
         gettimeofday(&gate_end, nullptr);
         stats->row_gate_reduction_ms =
             dmma_elapsed_ms(gate_begin, gate_end);
@@ -8973,10 +9342,84 @@ numeric_phase:
             goto numeric_failure;
         }
         row_dynamic_requested = gate_dynamic;
-        row_static_requested = !gate_dynamic;
+        /* A rejected auto gate must preserve the production tile-dynamic
+         * baseline.  The previous experiment selected row-static here, which
+         * changed numeric even on matrices where balancing was predicted not
+         * to help. */
+        row_static_requested = false;
+        row_worker_requested = gate_dynamic;
         stats->direct_numeric_layout =
             gate_dynamic ? DMMA_DIRECT_NUMERIC_ROW_DYNAMIC
-                         : DMMA_DIRECT_NUMERIC_ROW_STATIC;
+                         : DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
+    }
+    if (schedule.cost_balanced && output_tile_count > 0)
+    {
+        if (d_output_numeric_work == nullptr)
+        {
+            std::fprintf(stderr,
+                         "cost-balanced numeric requires Super16 task-work "
+                         "metadata.\n");
+            goto numeric_failure;
+        }
+        gettimeofday(&begin, nullptr);
+        int device = 0;
+        int sm_count = 0;
+        const std::size_t work_bytes =
+            static_cast<std::size_t>(output_tile_count) *
+            sizeof(*d_cost_sort_keys);
+        const std::size_t order_bytes =
+            static_cast<std::size_t>(output_tile_count) *
+            sizeof(*d_cost_task_order);
+        if (!dmma_cuda_ok(cudaGetDevice(&device),
+                          "read cost-balanced CUDA device") ||
+            !dmma_cuda_ok(cudaDeviceGetAttribute(
+                              &sm_count, cudaDevAttrMultiProcessorCount,
+                              device),
+                          "read cost-balanced SM count") ||
+            sm_count <= 0 ||
+            !dmma_cuda_ok(cudaMalloc(
+                              reinterpret_cast<void **>(&d_cost_sort_keys),
+                              work_bytes),
+                          "allocate cost-balanced sort keys") ||
+            !dmma_cuda_ok(cudaMalloc(
+                              reinterpret_cast<void **>(&d_cost_task_order),
+                              order_bytes),
+                          "allocate cost-balanced task order") ||
+            !dmma_cuda_ok(cudaMalloc(
+                              reinterpret_cast<void **>(&d_cost_queue_head),
+                              sizeof(*d_cost_queue_head)),
+                          "allocate cost-balanced queue head") ||
+            !dmma_cuda_ok(cudaMemcpy(
+                              d_cost_sort_keys, d_output_numeric_work,
+                              work_bytes, cudaMemcpyDeviceToDevice),
+                          "copy cost-balanced sort keys") ||
+            !dmma_cuda_ok(cudaMemset(d_cost_queue_head, 0,
+                                     sizeof(*d_cost_queue_head)),
+                          "clear cost-balanced queue head"))
+            goto numeric_failure;
+        try
+        {
+            thrust::device_ptr<std::uint64_t> keys(d_cost_sort_keys);
+            thrust::device_ptr<int> order(d_cost_task_order);
+            thrust::sequence(order, order + output_tile_count, 0);
+            thrust::sort_by_key(keys, keys + output_tile_count, order,
+                                thrust::greater<std::uint64_t>());
+        }
+        catch (const std::exception &exception)
+        {
+            std::fprintf(stderr,
+                         "Thrust error preparing cost-balanced order: %s\n",
+                         exception.what());
+            cudaGetLastError();
+            goto numeric_failure;
+        }
+        cost_worker_blocks = sm_count * schedule.cost_workers_per_sm;
+        stats->cost_balanced_used = true;
+        stats->cost_worker_blocks = cost_worker_blocks;
+        stats->cost_metadata_bytes = work_bytes + order_bytes +
+                                     sizeof(*d_cost_queue_head);
+        gettimeofday(&end, nullptr);
+        stats->scheduler_ms += dmma_elapsed_ms(begin, end);
     }
     gettimeofday(&begin, nullptr);
     if (!dmma_cuda_ok(cudaMalloc(
@@ -9518,7 +9961,18 @@ numeric_phase:
             goto numeric_failure;
         if (use_direct_numeric)
         {
-            if (row_worker_requested)
+            if (schedule.cost_balanced && output_tile_count > 0)
+            {
+                dmma_numeric_cost_queue_kernel
+                    <<<static_cast<unsigned int>(cost_worker_blocks),
+                       DMMA_THREADS_PER_BLOCK>>>(
+                        a, b, output_tile_count, d_cost_task_order,
+                        d_cost_queue_head, d_output_rows, d_output_cols,
+                        d_output_masks, d_output_nnz,
+                        d_output_tile_row_ptr, d_output_value_cols,
+                        d_output_values);
+            }
+            else if (row_worker_requested)
             {
                 dmma_numeric_row_worker_kernel<false>
                     <<<static_cast<unsigned int>(row_worker_count),
@@ -9557,7 +10011,9 @@ numeric_phase:
                             );
             }
             if (!dmma_cuda_ok(cudaGetLastError(),
-                              row_static_requested
+                              schedule.cost_balanced
+                                  ? "launch cost-balanced DMMA kernel"
+                                  : row_static_requested
                                   ? "launch row-static-block DMMA kernel"
                                   : (row_dynamic_requested
                                          ? "launch row-dynamic DMMA kernel"
@@ -10124,10 +10580,19 @@ numeric_phase:
             stats->row_gate_reduction_ms,
             stats->row_gate_valid ? 1 : 0,
             stats->row_gate_decision_dynamic ? "row-dynamic"
-                                             : "row-static-block",
+                                             : "tile-dynamic",
             dmma_direct_numeric_layout_name(
                 stats->direct_numeric_layout),
             stats->row_dynamic_queue_batch);
+    if (stats->cost_balanced_requested)
+        std::printf(
+            "DMMA_COST_BALANCE requested=1 used=%d model=hybrid-format-v1 "
+            "task_order=descending-work primitive=unchanged-tensor-core "
+            "worker_blocks=%d metadata_bytes=%zu scheduler_ms=%.6f "
+            "core_included=1\n",
+            stats->cost_balanced_used ? 1 : 0,
+            stats->cost_worker_blocks, stats->cost_metadata_bytes,
+            stats->scheduler_ms);
 
     /* These D2H audits are deliberately after both the native-output Core
      * endpoint and numeric_ms.  Placement establishes whether static and
@@ -10446,6 +10911,9 @@ numeric_phase:
     cudaFree(d_row_worker_sm_ids);
     cudaFree(d_row_dynamic_next_row);
     cudaFree(d_row_gate_summary);
+    cudaFree(d_cost_sort_keys);
+    cudaFree(d_cost_task_order);
+    cudaFree(d_cost_queue_head);
     cudaFree(d_persistent_queue_head);
     cudaFree(d_suffix_bulk_head);
     cudaFree(d_suffix_fine_head);
@@ -10469,6 +10937,7 @@ numeric_phase:
     cudaFree(d_output_masks);
     cudaFree(d_output_nnz);
     cudaFree(d_output_row_ptr);
+    cudaFree(d_output_numeric_work);
     cudaFree(d_candidate_row_ptr);
     cudaFree(d_candidate_rows);
     cudaFree(d_candidate_cols);
@@ -10537,10 +11006,14 @@ symbolic_cleanup:
     cudaFree(d_output_masks);
     cudaFree(d_output_nnz);
     cudaFree(d_output_row_ptr);
+    cudaFree(d_output_numeric_work);
 failure:
     cudaFree(d_row_worker_sm_ids);
     cudaFree(d_row_dynamic_next_row);
     cudaFree(d_row_gate_summary);
+    cudaFree(d_cost_sort_keys);
+    cudaFree(d_cost_task_order);
+    cudaFree(d_cost_queue_head);
     cudaFree(d_candidate_row_ptr);
     cudaFree(d_candidate_rows);
     cudaFree(d_candidate_cols);

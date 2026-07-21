@@ -25,6 +25,7 @@
 
 enum BUpdateMode
 {
+    B_UPDATE_NONE,
     B_UPDATE_VALUES,
     B_UPDATE_STRUCTURE
 };
@@ -73,6 +74,8 @@ struct Options
         CUSPARSE_WORKSPACE_PER_ITERATION;
     OutputExportMode output_export = OUTPUT_EXPORT_EVERY;
     DmmaNumericScheduleMode numeric_schedule = DMMA_SCHEDULE_DIRECT;
+    bool cost_balanced = false;
+    int cost_workers_per_sm = 4;
     DmmaDirectNumericLayout direct_numeric_layout =
         DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
     int row_queue_batch = 1;
@@ -142,7 +145,8 @@ static void print_usage(const char *program)
         "[--cusparse-workspace per-iteration|reusable] "
         "[--output-export every|last] "
         "[--symbolic-mode legacy|tileflex16] "
-        "[--numeric-schedule direct|split-cta|split-persistent|split-flat|tile-tail-queue|tile-early-split] "
+        "[--numeric-schedule direct|cost-balanced|split-cta|split-persistent|split-flat|tile-tail-queue|tile-early-split] "
+        "[--cost-workers-per-sm 1..16] "
         "[--direct-numeric-layout tile-dynamic|row-static-block|row-dynamic] "
         "[--row-queue-batch 1|2|4] "
         "[--row-dynamic-auto 0|1 --row-dynamic-threshold FLOAT] "
@@ -174,7 +178,7 @@ static void print_usage(const char *program)
         "[--collect-symbolic-load 0|1 --symbolic-load-quantum-ns FLOAT "
         "--symbolic-wave-ctas-per-sm N --symbolic-critical-waves N] "
         "[--bgrf-variant full|coarse|fine|coarse-row|coarse-inner|unguarded] "
-        "[--b-update values|structure] "
+        "[--b-update none|values|structure] "
         "[--b-values-clear always|noclear|safe-auto] [--no-reorder] "
         "[--row-order FILE --inner-order FILE --reorder-name NAME] "
         "[--dump-reorder-prefix P] [--dump-reorder-heatmap P] "
@@ -276,7 +280,15 @@ static bool parse_arguments(int argc, char **argv, Options *options)
         {
             const char *mode = argv[++i];
             if (std::strcmp(mode, "direct") == 0)
+            {
                 options->numeric_schedule = DMMA_SCHEDULE_DIRECT;
+                options->cost_balanced = false;
+            }
+            else if (std::strcmp(mode, "cost-balanced") == 0)
+            {
+                options->numeric_schedule = DMMA_SCHEDULE_DIRECT;
+                options->cost_balanced = true;
+            }
             else if (std::strcmp(mode, "split-cta") == 0)
                 options->numeric_schedule = DMMA_SCHEDULE_SPLIT_CTA;
             else if (std::strcmp(mode, "split-persistent") == 0)
@@ -308,6 +320,9 @@ static bool parse_arguments(int argc, char **argv, Options *options)
             else
                 return false;
         }
+        else if (std::strcmp(argv[i], "--cost-workers-per-sm") == 0 &&
+                 i + 1 < argc)
+            options->cost_workers_per_sm = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--row-queue-batch") == 0 &&
                  i + 1 < argc)
         {
@@ -504,7 +519,9 @@ static bool parse_arguments(int argc, char **argv, Options *options)
                  i + 1 < argc)
         {
             const char *mode = argv[++i];
-            if (std::strcmp(mode, "values") == 0)
+            if (std::strcmp(mode, "none") == 0)
+                options->b_update = B_UPDATE_NONE;
+            else if (std::strcmp(mode, "values") == 0)
                 options->b_update = B_UPDATE_VALUES;
             else if (std::strcmp(mode, "structure") == 0)
                 options->b_update = B_UPDATE_STRUCTURE;
@@ -587,6 +604,8 @@ static bool parse_arguments(int argc, char **argv, Options *options)
            options->dense_threshold >= 1 &&
            options->dense_threshold <= DMMA_INPUT_ELEMS &&
            options->warmup_iterations >= 0 && options->iterations > 0 &&
+           options->cost_workers_per_sm >= 1 &&
+           options->cost_workers_per_sm <= 16 &&
            std::isfinite(options->split_threshold_ns) &&
            options->split_threshold_ns > 0.0 &&
            std::isfinite(options->split_chunk_target_ns) &&
@@ -764,6 +783,12 @@ static const char *schedule_name(DmmaNumericScheduleMode mode)
     default:
         return "direct";
     }
+}
+
+static const char *effective_schedule_name(DmmaNumericScheduleMode mode,
+                                           bool cost_balanced)
+{
+    return cost_balanced ? "cost-balanced" : schedule_name(mode);
 }
 
 static const char *core_target_name(CoreTargetMode target)
@@ -1832,11 +1857,19 @@ static void print_b_update_stats(const char *label,
     }
 }
 
+static const char *b_update_mode_name(BUpdateMode mode)
+{
+    if (mode == B_UPDATE_NONE)
+        return "none";
+    return mode == B_UPDATE_VALUES ? "values" : "structure";
+}
+
 static void print_b_values_clear_marker(
     const char *phase, int iteration, const Options &options,
     const DmmaDynamicB &matrix, const DmmaBValuesClearDecision &decision)
 {
     const bool values_only = options.b_update == B_UPDATE_VALUES;
+    const bool no_update = options.b_update == B_UPDATE_NONE;
     const std::size_t payload_bytes =
         static_cast<std::size_t>(matrix.tiles.view.payload_size) *
         sizeof(MAT_VAL_TYPE);
@@ -1851,8 +1884,10 @@ static void print_b_values_clear_marker(
         "source_aliases_a=%d structure_legacy_rebuild=%d\n",
         phase, iteration,
         dmma_b_values_clear_policy_name(options.b_values_clear_policy),
-        values_only ? (decision.skip_clear ? "noclear" : "clear")
-                    : "structure-rebuild",
+        no_update ? "none-static-AA"
+                  : (values_only
+                         ? (decision.skip_clear ? "noclear" : "clear")
+                         : "structure-rebuild"),
         values_only ? 1 : 0,
         values_only && decision.clear_payload && payload_bytes > 0 ? 1 : 0,
         values_only && decision.skip_clear ? 1 : 0,
@@ -1865,7 +1900,7 @@ static void print_b_values_clear_marker(
         matrix.tiles.view.dense_tiles,
         matrix.tiles.view.dense_tiles == 0 ? 1 : 0,
         options.b_filename == nullptr ? 1 : 0,
-        values_only ? 0 : 1);
+        options.b_update == B_UPDATE_STRUCTURE ? 1 : 0);
 }
 
 static bool rebuild_b(const Options &options, const DmmaPreparedA &a,
@@ -1913,6 +1948,8 @@ int main(int argc, char **argv)
 
     DmmaNumericScheduleConfig schedule_config;
     schedule_config.tileflex16_symbolic = options.tileflex16_symbolic;
+    schedule_config.cost_balanced = options.cost_balanced;
+    schedule_config.cost_workers_per_sm = options.cost_workers_per_sm;
     DmmaReorderConfig reorder_config;
     if (!parse_dmma_reorder_variant(options.bgrf_variant,
                                     &reorder_config.variant))
@@ -2051,7 +2088,7 @@ int main(int argc, char **argv)
                 "iterations=%d, sequence=%d\n",
                 general_ab ? "AB" : (options.aat ? "AAT" : "AA"),
                 reorder_algorithm.c_str(),
-                options.b_update == B_UPDATE_VALUES ? "values" : "structure",
+                b_update_mode_name(options.b_update),
                 options.warmup_iterations, options.iterations,
                 options.benchmark_sequence_index);
     std::printf("DMMA tiles: A=8x4, B=4x8, C=8x8; "
@@ -2089,7 +2126,8 @@ int main(int argc, char **argv)
                 "wave_ctas_per_sm=%d critical_waves=%d "
                 "beta0=%.9g beta_scan=%.9g beta_match=%.9g "
                 "beta_output=%.9g\n",
-                schedule_name(schedule_config.mode),
+                effective_schedule_name(schedule_config.mode,
+                                        schedule_config.cost_balanced),
                 dmma_direct_numeric_layout_name(
                     schedule_config.direct_numeric_layout),
                 schedule_config.row_queue_batch,
@@ -2197,11 +2235,13 @@ int main(int argc, char **argv)
                 schedule_config.collect_task_stats ? 1 : 0);
     std::printf("CORE_COMPARABILITY b_update=%s comparable=%d "
                 "reason=%s\n",
-                options.b_update == B_UPDATE_VALUES ? "values" : "structure",
-                options.b_update == B_UPDATE_VALUES ? 1 : 0,
-                options.b_update == B_UPDATE_VALUES
-                    ? "matched-online-values-contract"
-                    : "cusparse-controls-do-not-rebuild-structure");
+                b_update_mode_name(options.b_update),
+                options.b_update != B_UPDATE_STRUCTURE ? 1 : 0,
+                options.b_update == B_UPDATE_NONE
+                    ? "static-AA-no-update"
+                    : (options.b_update == B_UPDATE_VALUES
+                           ? "matched-online-values-contract"
+                           : "cusparse-controls-do-not-rebuild-structure"));
     const bool core_target_runs_ours =
         options.core_target != CORE_TARGET_CUSPARSE;
     const bool core_target_runs_cusparse =
@@ -2526,7 +2566,7 @@ int main(int argc, char **argv)
 
     for (int warmup = 0; warmup < options.warmup_iterations; ++warmup)
     {
-        DmmaBUpdateStats update_stats;
+        DmmaBUpdateStats update_stats{};
         DmmaSpGemmStats warmup_stats;
         DmmaNumericScheduleConfig warmup_schedule = schedule_config;
         warmup_schedule.materialize_output = false;
@@ -2545,7 +2585,11 @@ int main(int argc, char **argv)
             goto cleanup;
         const std::chrono::steady_clock::time_point core_begin =
             std::chrono::steady_clock::now();
-        if (options.b_update == B_UPDATE_STRUCTURE)
+        if (options.b_update == B_UPDATE_NONE)
+        {
+            update_ok = true;
+        }
+        else if (options.b_update == B_UPDATE_STRUCTURE)
         {
             update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
                                   &update_stats);
@@ -2607,10 +2651,11 @@ int main(int argc, char **argv)
                     warmup_core_ms,
                     update_stats.total_ms,
                     update_stats.total_ms,
-                    options.b_update == B_UPDATE_VALUES ? "values" :
-                                                         "structure",
+                    b_update_mode_name(options.b_update),
                     warmup_stats.total_ms,
-                    schedule_name(warmup_stats.schedule_mode),
+                    effective_schedule_name(
+                        warmup_stats.schedule_mode,
+                        warmup_stats.cost_balanced_requested),
                     dmma_direct_numeric_layout_name(
                         warmup_stats.direct_numeric_layout),
                     warmup_stats.row_static_used ? 1 : 0,
@@ -2638,7 +2683,7 @@ int main(int argc, char **argv)
 
     for (int iteration = 0; iteration < options.iterations; ++iteration)
     {
-        DmmaBUpdateStats update_stats;
+        DmmaBUpdateStats update_stats{};
         DmmaSpGemmStats dmma_stats;
         DmmaNumericScheduleConfig iteration_schedule = schedule_config;
         const bool materialize_output =
@@ -2664,7 +2709,11 @@ int main(int argc, char **argv)
             goto cleanup;
         const std::chrono::steady_clock::time_point core_begin =
             std::chrono::steady_clock::now();
-        if (options.b_update == B_UPDATE_STRUCTURE)
+        if (options.b_update == B_UPDATE_NONE)
+        {
+            update_ok = true;
+        }
+        else if (options.b_update == B_UPDATE_STRUCTURE)
         {
             update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
                                   &update_stats);
@@ -2826,7 +2875,10 @@ int main(int argc, char **argv)
 
         std::printf("---------------- iteration %d/%d ----------------\n",
                     iteration + 1, options.iterations);
-        print_b_update_stats("Iteration", update_stats);
+        if (options.b_update == B_UPDATE_NONE)
+            std::printf("Iteration B update: none (static A*A)\n");
+        else
+            print_b_update_stats("Iteration", update_stats);
         std::printf("candidate C tiles=%llu; exact non-empty C tiles=%d; "
                     "nnzC=%d\n",
                     dmma_stats.candidate_tiles, dmma_stats.output_tiles,
@@ -2933,7 +2985,9 @@ int main(int argc, char **argv)
             "reduction_fraction=%.9f reduction_fraction_valid=%d "
             "workspace_bytes=%zu "
             "heavy_flag_bytes=%zu workspace_fallback=%d task_stats_ms=%.6f\n",
-            iteration + 1, schedule_name(dmma_stats.schedule_mode),
+            iteration + 1,
+            effective_schedule_name(dmma_stats.schedule_mode,
+                                    dmma_stats.cost_balanced_requested),
             dmma_direct_numeric_layout_name(
                 dmma_stats.direct_numeric_layout),
             dmma_stats.row_static_used ? 1 : 0,
@@ -3171,9 +3225,10 @@ int main(int argc, char **argv)
             "sequence=%d\n",
             iteration + 1, combined_ms, update_stats.total_ms,
             update_stats.total_ms,
-            options.b_update == B_UPDATE_VALUES ? "values" : "structure",
+            b_update_mode_name(options.b_update),
             dmma_stats.total_ms,
-            schedule_name(dmma_stats.schedule_mode),
+            effective_schedule_name(dmma_stats.schedule_mode,
+                                    dmma_stats.cost_balanced_requested),
             dmma_direct_numeric_layout_name(
                 dmma_stats.direct_numeric_layout),
             dmma_stats.row_static_used ? 1 : 0,
@@ -3260,7 +3315,7 @@ int main(int argc, char **argv)
                 "b_update_mode=%s "
                 "output_state=native-output-ready output_format=tile "
                 "sequence=%d warmup=%d iterations=%d samples_ms=",
-                options.b_update == B_UPDATE_VALUES ? "values" : "structure",
+                b_update_mode_name(options.b_update),
                 options.benchmark_sequence_index,
                 options.warmup_iterations, options.iterations);
     print_samples(combined_times);
@@ -3283,7 +3338,9 @@ int main(int argc, char **argv)
                 "workspace_fallback=%d output_export_mode=%s "
                 "materialized_samples=%zu\n",
                 minimum(combined_times), median(combined_times),
-                maximum(combined_times), schedule_name(schedule_config.mode),
+                maximum(combined_times),
+                effective_schedule_name(schedule_config.mode,
+                                        schedule_config.cost_balanced),
                 dmma_direct_numeric_layout_name(
                     summary_direct_numeric_layout),
                 schedule_config.row_queue_batch,
@@ -3326,7 +3383,7 @@ int main(int argc, char **argv)
         "clear_samples=%d noclear_samples=%d fallback_samples=%d "
         "legacy_always_clear_entrypoint=%d timing_boundary=unchanged\n",
         dmma_b_values_clear_policy_name(options.b_values_clear_policy),
-        options.b_update == B_UPDATE_VALUES ? "values" : "structure",
+        b_update_mode_name(options.b_update),
         options.b_update == B_UPDATE_VALUES ? options.iterations : 0,
         b_values_clear_timed_samples, b_values_noclear_timed_samples,
         b_values_clear_fallback_timed_samples,
