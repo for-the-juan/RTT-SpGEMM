@@ -57,6 +57,86 @@ static_assert(DMMA_REORDER_ROW_WINDOW % DMMA_TILE_M == 0,
 static_assert(DMMA_REORDER_INNER_WINDOW % DMMA_TILE_K == 0,
               "inner fine window must contain complete A K tiles");
 
+/* Public, stable ablation variants.  The default-constructed configuration
+ * is deliberately the production BGRF-v1 path used before these controls
+ * were introduced. */
+enum DmmaReorderVariant
+{
+    DMMA_REORDER_VARIANT_FULL,
+    DMMA_REORDER_VARIANT_COARSE,
+    DMMA_REORDER_VARIANT_FINE,
+    DMMA_REORDER_VARIANT_COARSE_ROW,
+    DMMA_REORDER_VARIANT_COARSE_INNER,
+    DMMA_REORDER_VARIANT_UNGUARDED
+};
+
+struct DmmaReorderConfig
+{
+    DmmaReorderVariant variant = DMMA_REORDER_VARIANT_FULL;
+};
+
+static inline const char *dmma_reorder_variant_name(
+    DmmaReorderVariant variant)
+{
+    switch (variant)
+    {
+    case DMMA_REORDER_VARIANT_FULL:
+        return "full";
+    case DMMA_REORDER_VARIANT_COARSE:
+        return "coarse";
+    case DMMA_REORDER_VARIANT_FINE:
+        return "fine";
+    case DMMA_REORDER_VARIANT_COARSE_ROW:
+        return "coarse-row";
+    case DMMA_REORDER_VARIANT_COARSE_INNER:
+        return "coarse-inner";
+    case DMMA_REORDER_VARIANT_UNGUARDED:
+        return "unguarded";
+    }
+    return nullptr;
+}
+
+static inline bool parse_dmma_reorder_variant(
+    const char *text, DmmaReorderVariant *variant)
+{
+    if (text == nullptr || variant == nullptr)
+        return false;
+    const DmmaReorderVariant candidates[] = {
+        DMMA_REORDER_VARIANT_FULL,
+        DMMA_REORDER_VARIANT_COARSE,
+        DMMA_REORDER_VARIANT_FINE,
+        DMMA_REORDER_VARIANT_COARSE_ROW,
+        DMMA_REORDER_VARIANT_COARSE_INNER,
+        DMMA_REORDER_VARIANT_UNGUARDED};
+    for (DmmaReorderVariant candidate : candidates)
+    {
+        const char *name = dmma_reorder_variant_name(candidate);
+        if (name != nullptr && std::strcmp(text, name) == 0)
+        {
+            *variant = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool resolve_dmma_reorder_variant(
+    DmmaReorderVariant variant, bool *enable_coarse,
+    bool *enable_row_fine, bool *enable_inner_fine,
+    bool *enable_exact_guard)
+{
+    if (enable_coarse == nullptr || enable_row_fine == nullptr ||
+        enable_inner_fine == nullptr || enable_exact_guard == nullptr)
+        return false;
+    *enable_coarse = variant != DMMA_REORDER_VARIANT_FINE;
+    *enable_row_fine = variant != DMMA_REORDER_VARIANT_COARSE &&
+                       variant != DMMA_REORDER_VARIANT_COARSE_INNER;
+    *enable_inner_fine = variant != DMMA_REORDER_VARIANT_COARSE &&
+                         variant != DMMA_REORDER_VARIANT_COARSE_ROW;
+    *enable_exact_guard = variant != DMMA_REORDER_VARIANT_UNGUARDED;
+    return dmma_reorder_variant_name(variant) != nullptr;
+}
+
 struct DmmaAxisProfile
 {
     int id = 0;
@@ -99,6 +179,7 @@ struct DmmaReorderPlan
     int active_inner = 0;
     bool unified = false;
     DmmaReorderKind kind = DMMA_REORDER_IDENTITY;
+    DmmaReorderVariant variant = DMMA_REORDER_VARIANT_FULL;
     char algorithm[80] = "identity-baseline";
     int sweeps = 0;
     int row_window = DMMA_REORDER_ROW_WINDOW;
@@ -1018,6 +1099,78 @@ static inline bool build_bgrf_global_coarse(
     *levels_out = levels;
     return cuda_ok(cudaStreamSynchronize(stream),
                    "complete BGRF global coarse traversal");
+}
+
+/* Variants that disable either fine axis do not have its DmmaAxisProfile
+ * array available for the final ActivePrefix reduction.  Compute the exact
+ * nonempty prefixes directly from CSR and the selected permutations.  One
+ * block handles one source row and emits at most one inner-axis atomicMax. */
+__global__ void compute_active_prefixes_kernel(
+    int rows, const int *row_ptr, const int *col_idx,
+    const int *row_old_to_new, const int *inner_old_to_new,
+    int *active_prefixes)
+{
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows)
+        return;
+    const int begin = row_ptr[row];
+    const int end = row_ptr[row + 1];
+    if (threadIdx.x == 0 && begin < end)
+        atomicMax(active_prefixes, row_old_to_new[row] + 1);
+
+    int local_inner_prefix = 0;
+    for (int entry = begin + static_cast<int>(threadIdx.x);
+         entry < end; entry += static_cast<int>(blockDim.x))
+        local_inner_prefix = max(
+            local_inner_prefix,
+            inner_old_to_new[col_idx[entry]] + 1);
+    __shared__ int block_inner_prefix[kThreads];
+    block_inner_prefix[threadIdx.x] = local_inner_prefix;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIdx.x < stride)
+            block_inner_prefix[threadIdx.x] = max(
+                block_inner_prefix[threadIdx.x],
+                block_inner_prefix[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0 && block_inner_prefix[0] > 0)
+        atomicMax(active_prefixes + 1, block_inner_prefix[0]);
+}
+
+static inline bool compute_active_prefixes(
+    int rows, const int *d_row_ptr, const int *d_col_idx,
+    const thrust::device_vector<int> &row_old_to_new,
+    const thrust::device_vector<int> &inner_old_to_new,
+    int *active_rows, int *active_inner, cudaStream_t stream)
+{
+    if (active_rows == nullptr || active_inner == nullptr)
+        return false;
+    *active_rows = 0;
+    *active_inner = 0;
+    if (rows == 0)
+        return true;
+    thrust::device_vector<int> prefixes(2, 0);
+    compute_active_prefixes_kernel<<<rows, kThreads, 0, stream>>>(
+        rows, d_row_ptr, d_col_idx,
+        thrust::raw_pointer_cast(row_old_to_new.data()),
+        thrust::raw_pointer_cast(inner_old_to_new.data()),
+        thrust::raw_pointer_cast(prefixes.data()));
+    int host_prefixes[2] = {0, 0};
+    if (!cuda_ok(cudaGetLastError(), "compute BGRF active prefixes") ||
+        !cuda_ok(cudaMemcpyAsync(
+                     host_prefixes,
+                     thrust::raw_pointer_cast(prefixes.data()),
+                     sizeof(host_prefixes), cudaMemcpyDeviceToHost,
+                     stream),
+                 "copy BGRF active prefixes") ||
+        !cuda_ok(cudaStreamSynchronize(stream),
+                 "complete BGRF active prefixes"))
+        return false;
+    *active_rows = host_prefixes[0];
+    *active_inner = host_prefixes[1];
+    return true;
 }
 
 __global__ void extract_row_profiles_kernel(
@@ -2497,7 +2650,8 @@ failure:
 
 static inline bool build_dmma_reorder_plan(
     int rows, int cols, int nnz, const int *d_row_ptr, const int *d_col_idx,
-    int dense_threshold, DmmaReorderPlan *out, cudaStream_t stream = 0)
+    int dense_threshold, DmmaReorderPlan *out, cudaStream_t stream = 0,
+    const DmmaReorderConfig *config = nullptr)
 {
     using namespace dmma_reorder_detail;
     if (out == nullptr || rows < 0 || cols < 0 || nnz < 0 ||
@@ -2505,13 +2659,33 @@ static inline bool build_dmma_reorder_plan(
         d_row_ptr == nullptr || (nnz > 0 && d_col_idx == nullptr))
         return false;
 
+    const DmmaReorderVariant variant =
+        config == nullptr ? DMMA_REORDER_VARIANT_FULL : config->variant;
+    bool enable_coarse = false;
+    bool enable_row_fine = false;
+    bool enable_inner_fine = false;
+    bool enable_exact_guard = false;
+    if (!resolve_dmma_reorder_variant(
+            variant, &enable_coarse, &enable_row_fine,
+            &enable_inner_fine, &enable_exact_guard))
+    {
+        std::fprintf(stderr, "Invalid BGRF reorder variant.\n");
+        return false;
+    }
+    const bool enable_any_fine = enable_row_fine || enable_inner_fine;
+
     DmmaReorderPlan result;
     result.rows = rows;
     result.cols = cols;
     result.nnz = nnz;
     result.unified = true;
     result.kind = DMMA_REORDER_UNIFIED;
-    std::snprintf(result.algorithm, sizeof(result.algorithm), "bgrf-v1");
+    result.variant = variant;
+    if (variant == DMMA_REORDER_VARIANT_FULL)
+        std::snprintf(result.algorithm, sizeof(result.algorithm), "bgrf-v1");
+    else
+        std::snprintf(result.algorithm, sizeof(result.algorithm),
+                      "bgrf-v1-%s", dmma_reorder_variant_name(variant));
     result.sweeps = DMMA_REORDER_SWEEPS;
     const auto reorder_start = std::chrono::steady_clock::now();
 
@@ -2522,94 +2696,173 @@ static inline bool build_dmma_reorder_plan(
         thrust::device_vector<int> row_old_to_new(rows);
         thrust::device_vector<int> inner_new_to_old(cols);
         thrust::device_vector<int> inner_old_to_new(cols);
-        thrust::device_vector<int> rcm_row_old_to_new(rows);
-        thrust::device_vector<int> rcm_inner_old_to_new(cols);
+        thrust::device_vector<int> rcm_row_old_to_new(
+            enable_coarse ? rows : 0);
+        thrust::device_vector<int> rcm_inner_old_to_new(
+            enable_coarse ? cols : 0);
         std::size_t coarse_peak = 0;
-        if (!build_bgrf_global_coarse(
-                rows, cols, nnz, d_row_ptr, d_col_idx,
-                row_new_to_old, row_old_to_new, inner_new_to_old,
-                inner_old_to_new, rcm_row_old_to_new,
-                rcm_inner_old_to_new, &result.active_rows,
-                &result.active_inner, &result.coarse_components,
-                &result.coarse_levels, &coarse_peak, stream))
-            goto failure;
-        thrust::device_vector<int> proposal_row_new_to_old(rows);
-        thrust::device_vector<int> proposal_row_old_to_new(rows);
-        thrust::device_vector<int> proposal_inner_new_to_old(cols);
-        thrust::device_vector<int> proposal_inner_old_to_new(cols);
-        thrust::device_vector<DmmaAxisProfile> row_profiles(rows);
-        thrust::device_vector<DmmaAxisProfile> inner_profiles(cols);
+        if (enable_coarse)
+        {
+            if (!build_bgrf_global_coarse(
+                    rows, cols, nnz, d_row_ptr, d_col_idx,
+                    row_new_to_old, row_old_to_new, inner_new_to_old,
+                    inner_old_to_new, rcm_row_old_to_new,
+                    rcm_inner_old_to_new, &result.active_rows,
+                    &result.active_inner, &result.coarse_components,
+                    &result.coarse_levels, &coarse_peak, stream))
+                goto failure;
+        }
+        else
+        {
+            thrust::sequence(policy, row_new_to_old.begin(),
+                             row_new_to_old.end());
+            thrust::sequence(policy, row_old_to_new.begin(),
+                             row_old_to_new.end());
+            thrust::sequence(policy, inner_new_to_old.begin(),
+                             inner_new_to_old.end());
+            thrust::sequence(policy, inner_old_to_new.begin(),
+                             inner_old_to_new.end());
+        }
+        const bool need_proposals = enable_coarse || enable_any_fine;
+        thrust::device_vector<int> proposal_row_new_to_old(
+            need_proposals ? rows : 0);
+        thrust::device_vector<int> proposal_row_old_to_new(
+            need_proposals ? rows : 0);
+        thrust::device_vector<int> proposal_inner_new_to_old(
+            need_proposals ? cols : 0);
+        thrust::device_vector<int> proposal_inner_old_to_new(
+            need_proposals ? cols : 0);
+        thrust::device_vector<DmmaAxisProfile> row_profiles(
+            enable_row_fine ? rows : 0);
+        thrust::device_vector<DmmaAxisProfile> inner_profiles(
+            enable_inner_fine ? cols : 0);
         thrust::device_vector<uint64_t> exact_keys(
-            static_cast<std::size_t>(2) * static_cast<std::size_t>(nnz));
+            enable_exact_guard && need_proposals
+                ? static_cast<std::size_t>(2) *
+                      static_cast<std::size_t>(nnz)
+                : 0);
         const int max_windows = std::max(
-            ceil_div_nonnegative(rows, DMMA_REORDER_ROW_WINDOW),
-            ceil_div_nonnegative(cols, DMMA_REORDER_INNER_WINDOW));
+            enable_row_fine
+                ? ceil_div_nonnegative(rows, DMMA_REORDER_ROW_WINDOW)
+                : 0,
+            enable_inner_fine
+                ? ceil_div_nonnegative(cols, DMMA_REORDER_INNER_WINDOW)
+                : 0);
         constexpr int max_groups = std::max(
             DMMA_REORDER_ROW_WINDOW / DMMA_TILE_M,
             DMMA_REORDER_INNER_WINDOW / DMMA_TILE_K);
         thrust::device_vector<int> exact_counts(
-            static_cast<std::size_t>(2) * max_windows, 0);
+            enable_exact_guard && enable_any_fine
+                ? static_cast<std::size_t>(2) * max_windows
+                : 0,
+            0);
         thrust::device_vector<int> exact_span_min(
-            static_cast<std::size_t>(2) * max_windows * max_groups,
+            enable_exact_guard && enable_any_fine
+                ? static_cast<std::size_t>(2) * max_windows * max_groups
+                : 0,
             INT_MAX);
         thrust::device_vector<int> exact_span_max(
-            static_cast<std::size_t>(2) * max_windows * max_groups, -1);
+            enable_exact_guard && enable_any_fine
+                ? static_cast<std::size_t>(2) * max_windows * max_groups
+                : 0,
+            -1);
         thrust::device_vector<int> exact_fanout(
-            static_cast<std::size_t>(2) * max_windows, 0);
-        thrust::device_vector<unsigned long long> exact_stats(8, 0);
+            enable_exact_guard && enable_any_fine
+                ? static_cast<std::size_t>(2) * max_windows
+                : 0,
+            0);
+        thrust::device_vector<unsigned long long> exact_stats(
+            enable_exact_guard && enable_any_fine ? 8 : 0, 0);
         unsigned long long h_exact_stats[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
+        const std::size_t proposal_bytes =
+            (need_proposals ? static_cast<std::size_t>(4) : 0) *
+                (static_cast<std::size_t>(rows) +
+                 static_cast<std::size_t>(cols)) * sizeof(int);
+        const std::size_t rcm_bytes =
+            (enable_coarse ? static_cast<std::size_t>(2) : 0) *
+                (static_cast<std::size_t>(rows) +
+                 static_cast<std::size_t>(cols)) * sizeof(int);
+        const std::size_t profile_bytes =
+            ((enable_row_fine ? static_cast<std::size_t>(rows) : 0) +
+             (enable_inner_fine ? static_cast<std::size_t>(cols) : 0)) *
+            sizeof(DmmaAxisProfile);
+        const std::size_t exact_key_bytes =
+            enable_exact_guard
+                ? static_cast<std::size_t>(2) * nnz * sizeof(uint64_t)
+                : 0;
+        const std::size_t exact_window_bytes =
+            enable_exact_guard && enable_any_fine
+                ? static_cast<std::size_t>(4) * max_windows * sizeof(int) +
+                      static_cast<std::size_t>(4) * max_windows *
+                          max_groups * sizeof(int) +
+                      static_cast<std::size_t>(8) *
+                          sizeof(unsigned long long)
+                : 0;
         const std::size_t fine_peak =
-            static_cast<std::size_t>(4) *
-                (static_cast<std::size_t>(rows) +
-                 static_cast<std::size_t>(cols)) * sizeof(int) +
-            static_cast<std::size_t>(2) *
-                (static_cast<std::size_t>(rows) +
-                 static_cast<std::size_t>(cols)) * sizeof(int) +
-            static_cast<std::size_t>(rows + cols) *
-                sizeof(DmmaAxisProfile) +
-            static_cast<std::size_t>(2) * nnz * sizeof(uint64_t) +
-            static_cast<std::size_t>(4) * max_windows * sizeof(int) +
-            static_cast<std::size_t>(4) * max_windows * max_groups *
-                sizeof(int) +
-            static_cast<std::size_t>(8) * sizeof(unsigned long long);
+            proposal_bytes + rcm_bytes + profile_bytes + exact_key_bytes +
+            exact_window_bytes;
         result.reorder_peak_workspace_bytes =
             std::max(coarse_peak, fine_peak);
 
-        thrust::copy(policy, rcm_row_old_to_new.begin(),
-                     rcm_row_old_to_new.end(),
-                     proposal_row_old_to_new.begin());
-        thrust::copy(policy, rcm_inner_old_to_new.begin(),
-                     rcm_inner_old_to_new.end(),
-                     proposal_inner_old_to_new.begin());
-        if (rows > 0)
-            invert_old_to_new_kernel<<<blocks_for(rows), kThreads, 0,
-                                       stream>>>(
-                rows,
-                thrust::raw_pointer_cast(proposal_row_old_to_new.data()),
-                thrust::raw_pointer_cast(proposal_row_new_to_old.data()));
-        if (cols > 0)
-            invert_old_to_new_kernel<<<blocks_for(cols), kThreads, 0,
-                                       stream>>>(
-                cols,
-                thrust::raw_pointer_cast(proposal_inner_old_to_new.data()),
-                thrust::raw_pointer_cast(proposal_inner_new_to_old.data()));
-        if (!cuda_ok(cudaGetLastError(), "materialize joint RCM proposal") ||
-            !exact_joint_global_commit(
-                rows, cols, nnz, d_row_ptr, d_col_idx,
-                row_new_to_old, row_old_to_new,
-                proposal_row_new_to_old, proposal_row_old_to_new,
-                inner_new_to_old, inner_old_to_new,
-                proposal_inner_new_to_old, proposal_inner_old_to_new,
-                exact_keys, &result.coarse_candidate_accepted,
-                &result.coarse_tile_reduction, stream))
-            goto failure;
+        if (enable_coarse)
+        {
+            thrust::copy(policy, rcm_row_old_to_new.begin(),
+                         rcm_row_old_to_new.end(),
+                         proposal_row_old_to_new.begin());
+            thrust::copy(policy, rcm_inner_old_to_new.begin(),
+                         rcm_inner_old_to_new.end(),
+                         proposal_inner_old_to_new.begin());
+            if (rows > 0)
+                invert_old_to_new_kernel<<<blocks_for(rows), kThreads, 0,
+                                           stream>>>(
+                    rows,
+                    thrust::raw_pointer_cast(
+                        proposal_row_old_to_new.data()),
+                    thrust::raw_pointer_cast(
+                        proposal_row_new_to_old.data()));
+            if (cols > 0)
+                invert_old_to_new_kernel<<<blocks_for(cols), kThreads, 0,
+                                           stream>>>(
+                    cols,
+                    thrust::raw_pointer_cast(
+                        proposal_inner_old_to_new.data()),
+                    thrust::raw_pointer_cast(
+                        proposal_inner_new_to_old.data()));
+            if (!cuda_ok(cudaGetLastError(),
+                         "materialize joint RCM proposal"))
+                goto failure;
+            if (enable_exact_guard)
+            {
+                if (!exact_joint_global_commit(
+                        rows, cols, nnz, d_row_ptr, d_col_idx,
+                        row_new_to_old, row_old_to_new,
+                        proposal_row_new_to_old,
+                        proposal_row_old_to_new, inner_new_to_old,
+                        inner_old_to_new, proposal_inner_new_to_old,
+                        proposal_inner_old_to_new, exact_keys,
+                        &result.coarse_candidate_accepted,
+                        &result.coarse_tile_reduction, stream))
+                    goto failure;
+            }
+            else
+            {
+                row_new_to_old.swap(proposal_row_new_to_old);
+                row_old_to_new.swap(proposal_row_old_to_new);
+                inner_new_to_old.swap(proposal_inner_new_to_old);
+                inner_old_to_new.swap(proposal_inner_old_to_new);
+                result.coarse_candidate_accepted = nnz > 0;
+            }
+        }
         const auto fine_start = std::chrono::steady_clock::now();
-        result.coarse_ms = std::chrono::duration<double, std::milli>(
-                               fine_start - reorder_start)
-                               .count();
+        result.coarse_ms =
+            enable_coarse
+                ? std::chrono::duration<double, std::milli>(
+                      fine_start - reorder_start)
+                      .count()
+                : 0.0;
 
-        if (rows > 0)
+        if (enable_row_fine && rows > 0)
         {
             extract_row_profiles_kernel<<<blocks_for(rows), kThreads, 0,
                                             stream>>>(
@@ -2634,24 +2887,39 @@ static inline bool build_dmma_reorder_plan(
                 rows,
                 thrust::raw_pointer_cast(proposal_row_new_to_old.data()),
                 thrust::raw_pointer_cast(proposal_row_old_to_new.data()));
-            if (!cuda_ok(cudaGetLastError(), "propose BGRF row packing") ||
-                !exact_monotone_commit<true, DMMA_REORDER_ROW_WINDOW>(
-                    rows, cols, nnz, d_row_ptr, d_col_idx,
-                    row_new_to_old, row_old_to_new,
-                    proposal_row_new_to_old, proposal_row_old_to_new,
-                    inner_new_to_old, inner_old_to_new,
-                    proposal_inner_new_to_old,
-                    proposal_inner_old_to_new, exact_keys, exact_counts,
-                    exact_span_min, exact_span_max, exact_fanout,
-                    thrust::raw_pointer_cast(exact_stats.data()),
-                    thrust::raw_pointer_cast(exact_stats.data()) + 1,
-                    thrust::raw_pointer_cast(exact_stats.data()) + 4,
-                    thrust::raw_pointer_cast(exact_stats.data()) + 5,
-                    stream))
+            if (!cuda_ok(cudaGetLastError(),
+                         "propose BGRF row packing"))
                 goto failure;
+            if (enable_exact_guard)
+            {
+                if (!exact_monotone_commit<
+                        true, DMMA_REORDER_ROW_WINDOW>(
+                        rows, cols, nnz, d_row_ptr, d_col_idx,
+                        row_new_to_old, row_old_to_new,
+                        proposal_row_new_to_old,
+                        proposal_row_old_to_new, inner_new_to_old,
+                        inner_old_to_new, proposal_inner_new_to_old,
+                        proposal_inner_old_to_new, exact_keys,
+                        exact_counts, exact_span_min, exact_span_max,
+                        exact_fanout,
+                        thrust::raw_pointer_cast(exact_stats.data()),
+                        thrust::raw_pointer_cast(exact_stats.data()) + 1,
+                        thrust::raw_pointer_cast(exact_stats.data()) + 4,
+                        thrust::raw_pointer_cast(exact_stats.data()) + 5,
+                        stream))
+                    goto failure;
+            }
+            else
+            {
+                row_new_to_old.swap(proposal_row_new_to_old);
+                row_old_to_new.swap(proposal_row_old_to_new);
+                result.accepted_row_windows = static_cast<unsigned long long>(
+                    ceil_div_nonnegative(
+                        rows, DMMA_REORDER_ROW_WINDOW));
+            }
         }
 
-        if (cols > 0)
+        if (enable_inner_fine && cols > 0)
         {
             initialize_profiles_kernel<<<blocks_for(cols), kThreads, 0,
                                            stream>>>(
@@ -2686,50 +2954,79 @@ static inline bool build_dmma_reorder_plan(
                 cols,
                 thrust::raw_pointer_cast(proposal_inner_new_to_old.data()),
                 thrust::raw_pointer_cast(proposal_inner_old_to_new.data()));
-            if (!cuda_ok(cudaGetLastError(), "propose BGRF inner packing") ||
-                !exact_monotone_commit<false,
-                                       DMMA_REORDER_INNER_WINDOW>(
-                    rows, cols, nnz, d_row_ptr, d_col_idx,
-                    row_new_to_old, row_old_to_new,
-                    proposal_row_new_to_old, proposal_row_old_to_new,
-                    inner_new_to_old, inner_old_to_new,
-                    proposal_inner_new_to_old,
-                    proposal_inner_old_to_new, exact_keys, exact_counts,
-                    exact_span_min, exact_span_max, exact_fanout,
-                    thrust::raw_pointer_cast(exact_stats.data()) + 2,
-                    thrust::raw_pointer_cast(exact_stats.data()) + 3,
-                    thrust::raw_pointer_cast(exact_stats.data()) + 6,
-                    thrust::raw_pointer_cast(exact_stats.data()) + 7,
-                    stream))
+            if (!cuda_ok(cudaGetLastError(),
+                         "propose BGRF inner packing"))
                 goto failure;
+            if (enable_exact_guard)
+            {
+                if (!exact_monotone_commit<
+                        false, DMMA_REORDER_INNER_WINDOW>(
+                        rows, cols, nnz, d_row_ptr, d_col_idx,
+                        row_new_to_old, row_old_to_new,
+                        proposal_row_new_to_old,
+                        proposal_row_old_to_new, inner_new_to_old,
+                        inner_old_to_new, proposal_inner_new_to_old,
+                        proposal_inner_old_to_new, exact_keys,
+                        exact_counts, exact_span_min, exact_span_max,
+                        exact_fanout,
+                        thrust::raw_pointer_cast(exact_stats.data()) + 2,
+                        thrust::raw_pointer_cast(exact_stats.data()) + 3,
+                        thrust::raw_pointer_cast(exact_stats.data()) + 6,
+                        thrust::raw_pointer_cast(exact_stats.data()) + 7,
+                        stream))
+                    goto failure;
+            }
+            else
+            {
+                inner_new_to_old.swap(proposal_inner_new_to_old);
+                inner_old_to_new.swap(proposal_inner_old_to_new);
+                result.accepted_inner_windows =
+                    static_cast<unsigned long long>(
+                        ceil_div_nonnegative(
+                            cols, DMMA_REORDER_INNER_WINDOW));
+            }
         }
 
-        result.active_rows = rows == 0
-                                 ? 0
-                                 : thrust::transform_reduce(
-                                       policy, row_profiles.begin(),
-                                       row_profiles.end(),
-                                       ActivePrefix{
-                                           thrust::raw_pointer_cast(
-                                               row_old_to_new.data())},
-                                       0, thrust::maximum<int>());
-        result.active_inner = cols == 0
-                                  ? 0
-                                  : thrust::transform_reduce(
-                                        policy, inner_profiles.begin(),
-                                        inner_profiles.end(),
-                                        ActivePrefix{
-                                            thrust::raw_pointer_cast(
-                                                inner_old_to_new.data())},
-                                        0, thrust::maximum<int>());
+        int fallback_active_rows = 0;
+        int fallback_active_inner = 0;
+        if ((!enable_row_fine || !enable_inner_fine) &&
+            !compute_active_prefixes(
+                rows, d_row_ptr, d_col_idx, row_old_to_new,
+                inner_old_to_new, &fallback_active_rows,
+                &fallback_active_inner, stream))
+            goto failure;
+        result.active_rows =
+            !enable_row_fine
+                ? fallback_active_rows
+                : (rows == 0
+                       ? 0
+                       : thrust::transform_reduce(
+                             policy, row_profiles.begin(),
+                             row_profiles.end(),
+                             ActivePrefix{thrust::raw_pointer_cast(
+                                 row_old_to_new.data())},
+                             0, thrust::maximum<int>()));
+        result.active_inner =
+            !enable_inner_fine
+                ? fallback_active_inner
+                : (cols == 0
+                       ? 0
+                       : thrust::transform_reduce(
+                             policy, inner_profiles.begin(),
+                             inner_profiles.end(),
+                             ActivePrefix{thrust::raw_pointer_cast(
+                                 inner_old_to_new.data())},
+                             0, thrust::maximum<int>()));
 
-        if (!cuda_ok(cudaMemcpyAsync(
+        if (enable_exact_guard && enable_any_fine &&
+            !cuda_ok(cudaMemcpyAsync(
                          h_exact_stats,
                          thrust::raw_pointer_cast(exact_stats.data()),
                          sizeof(h_exact_stats), cudaMemcpyDeviceToHost,
                          stream),
-                     "copy BGRF fine statistics") ||
-            !copy_device_permutation_to_owned(
+                     "copy BGRF fine statistics"))
+            goto failure;
+        if (!copy_device_permutation_to_owned(
                 row_new_to_old, row_old_to_new,
                 &result.h_row_new_to_old, &result.h_row_old_to_new,
                 &result.d_row_new_to_old, &result.d_row_old_to_new, stream) ||
@@ -2742,17 +3039,23 @@ static inline bool build_dmma_reorder_plan(
                      "complete BGRF permutation"))
             goto failure;
 
-        result.accepted_row_windows = h_exact_stats[0];
-        result.row_tile_reduction = h_exact_stats[1];
-        result.accepted_inner_windows = h_exact_stats[2];
-        result.inner_tile_reduction = h_exact_stats[3];
-        result.row_fanout_before = h_exact_stats[4];
-        result.row_fanout_after = h_exact_stats[5];
-        result.inner_fanout_before = h_exact_stats[6];
-        result.inner_fanout_after = h_exact_stats[7];
-        result.fine_ms = std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - fine_start)
-                             .count();
+        if (enable_exact_guard && enable_any_fine)
+        {
+            result.accepted_row_windows = h_exact_stats[0];
+            result.row_tile_reduction = h_exact_stats[1];
+            result.accepted_inner_windows = h_exact_stats[2];
+            result.inner_tile_reduction = h_exact_stats[3];
+            result.row_fanout_before = h_exact_stats[4];
+            result.row_fanout_after = h_exact_stats[5];
+            result.inner_fanout_before = h_exact_stats[6];
+            result.inner_fanout_after = h_exact_stats[7];
+        }
+        result.fine_ms =
+            enable_any_fine
+                ? std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - fine_start)
+                      .count()
+                : 0.0;
         summarize_permutation(result.h_row_old_to_new, rows,
                               &result.moved_rows,
                               &result.row_displacement);

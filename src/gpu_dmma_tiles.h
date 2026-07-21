@@ -3,6 +3,7 @@
 
 #include "dmma_spgemm.h"
 #include "dmma_reorder.h"
+#include "dmma_b_values_clear_policy.h"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -69,6 +70,7 @@ struct DmmaBUpdateStats
     double tile_build_ms = 0.0;
     double csc_ms = 0.0;
     double mapping_ms = 0.0;
+    double low_fill_metadata_ms = 0.0;
     double value_update_ms = 0.0;
     double total_ms = 0.0;
     std::size_t peak_workspace_bytes = 0;
@@ -101,6 +103,11 @@ struct DmmaDynamicB
     int active_rows = 0;
     int active_entries = 0;
     bool has_duplicates = false;
+    /* Hard eligibility facts for values-only no-clear updates.  A successful
+     * rebuild sets both only after pack and source-map construction finish. */
+    bool active_source_mapping_complete = false;
+    bool active_source_to_payload_injective = false;
+    bool payload_fully_initialized = false;
     bool valid = false;
     DmmaBWorkspace workspace;
 };
@@ -726,6 +733,37 @@ static inline bool build_csc(
     return true;
 }
 
+/* One thread owns one A tile row or B tile column.  This is static structural
+ * preprocessing, not a timed task counter.  uint64 accumulation prevents a
+ * wrap from making a dense row/column look sparse; overflow invalidates the
+ * whole optional component before either low-fill kernel can launch. */
+__global__ void build_low_fill_tile_nnz_sum_kernel(
+    DmmaDeviceTiles tiles, int use_csc, int entry_count,
+    uint32_t *__restrict__ sums, int *__restrict__ overflow)
+{
+    const int entry = blockIdx.x * blockDim.x + threadIdx.x;
+    if (entry >= entry_count)
+        return;
+    unsigned long long sum = 0;
+    if (use_csc != 0)
+    {
+        for (int p = tiles.tile_col_ptr[entry];
+             p < tiles.tile_col_ptr[entry + 1]; ++p)
+            sum += static_cast<unsigned long long>(
+                __popc(tiles.masks[tiles.csc_tile_ids[p]]));
+    }
+    else
+    {
+        for (int p = tiles.tile_row_ptr[entry];
+             p < tiles.tile_row_ptr[entry + 1]; ++p)
+            sum += static_cast<unsigned long long>(__popc(tiles.masks[p]));
+    }
+    if (sum > UINT_MAX)
+        atomicExch(overflow, 1);
+    else
+        sums[entry] = static_cast<uint32_t>(sum);
+}
+
 static inline bool build_tiles(const DmmaOwnedDeviceCsr &csr,
                                bool logical_transpose, int tile_rows,
                                int tile_cols, bool payload_col_major,
@@ -967,6 +1005,8 @@ static inline bool build_tiles(const DmmaOwnedDeviceCsr &csr,
         result.view.payload_size = payload_size;
         result.view.dense_tiles = dense_tiles;
         result.view.sparse_tiles = tile_count - dense_tiles;
+        result.view.structural_nnz =
+            static_cast<unsigned long long>(unique_entry_count);
         result.view.tile_row_ptr = result.tile_row_ptr;
         result.view.tile_col_idx = result.tile_col_idx;
         result.view.value_offsets = result.value_offsets;
@@ -1240,6 +1280,8 @@ static inline bool rebuild_dynamic_b(
         result.view.payload_size = payload_size;
         result.view.dense_tiles = dense_tiles;
         result.view.sparse_tiles = tile_count - dense_tiles;
+        result.view.structural_nnz =
+            static_cast<unsigned long long>(unique_entry_count);
         result.view.tile_row_ptr = result.tile_row_ptr;
         result.view.tile_col_idx = result.tile_col_idx;
         result.view.value_offsets = result.value_offsets;
@@ -1312,6 +1354,16 @@ static inline bool rebuild_dynamic_b(
         out->active_rows = active_inner_rows;
         out->active_entries = active_entry_count;
         out->has_duplicates = active_entry_count != unique_entry_count;
+        /* Every active source is assigned the inclusive ID of its sorted
+         * structural key.  With no repeated keys, unique_to_payload maps
+         * those IDs to disjoint tile offsets (dense: physical lane; sparse:
+         * local rank), hence the active source map is injective. */
+        out->active_source_mapping_complete = true;
+        out->active_source_to_payload_injective =
+            active_entry_count == unique_entry_count;
+        /* pack_tiles_kernel initializes every sparse slot and all 32 lanes
+         * of every dense tile before this synchronized rebuild commits. */
+        out->payload_fully_initialized = true;
         out->valid = true;
         stats->total_ms = milliseconds(total_begin, Clock::now());
         return true;
@@ -1353,6 +1405,69 @@ static inline bool update_dynamic_b_values(
                               sizeof(MAT_VAL_TYPE),
                           stream),
                       "clear dynamic B payload values"))
+    {
+        matrix->valid = false;
+        return false;
+    }
+    if (nnz > 0)
+    {
+        update_payload_values_kernel<<<block_count(nnz), kThreads, 0,
+                                       stream>>>(
+            nnz, device_values, matrix->source_to_payload,
+            matrix->has_duplicates, matrix->tiles.values);
+        if (!dmma_cuda_ok(cudaGetLastError(),
+                          "launch dynamic B value update"))
+        {
+            matrix->valid = false;
+            return false;
+        }
+    }
+    if (!dmma_cuda_ok(cudaStreamSynchronize(stream),
+                      "complete dynamic B value update"))
+    {
+        matrix->valid = false;
+        return false;
+    }
+    stats->value_update_ms = milliseconds(begin, Clock::now());
+    stats->total_ms = stats->value_update_ms;
+    return true;
+}
+
+/* Optional fast path.  The legacy entry point above remains byte-for-byte in
+ * charge of the default always-clear policy.  This separate function is used
+ * only for an explicit non-default policy, so the default Core path gains no
+ * policy-selection work. */
+static inline bool update_dynamic_b_values_with_policy(
+    const MAT_VAL_TYPE *device_values, int nnz, DmmaDynamicB *matrix,
+    DmmaBValuesClearPolicy policy, DmmaBValuesClearDecision *decision_out,
+    DmmaBUpdateStats *stats, cudaStream_t stream = 0)
+{
+    if (matrix == nullptr || stats == nullptr || decision_out == nullptr ||
+        !matrix->valid || nnz < 0 || nnz != matrix->source_nnz ||
+        (nnz > 0 && device_values == nullptr) ||
+        policy == DMMA_B_VALUES_ALWAYS_CLEAR)
+        return false;
+
+    *stats = DmmaBUpdateStats();
+    stats->source_entries = nnz;
+    stats->active_entries = matrix->active_entries;
+    const auto begin = Clock::now();
+    const DmmaBValuesClearDecision decision = dmma_choose_b_values_clear(
+        policy, true, matrix->valid, matrix->has_duplicates,
+        matrix->active_source_mapping_complete,
+        matrix->active_source_to_payload_injective,
+        matrix->payload_fully_initialized,
+        matrix->tiles.view.dense_tiles == 0, true);
+    *decision_out = decision;
+
+    if (decision.clear_payload && matrix->tiles.view.payload_size > 0 &&
+        !dmma_cuda_ok(cudaMemsetAsync(
+                          matrix->tiles.values, 0,
+                          static_cast<std::size_t>(
+                              matrix->tiles.view.payload_size) *
+                              sizeof(MAT_VAL_TYPE),
+                          stream),
+                      "clear dynamic B payload values (safe fallback)"))
     {
         matrix->valid = false;
         return false;
@@ -1482,6 +1597,113 @@ static inline bool compute_nnz_cub_ab(
 
 } // namespace gpu_dmma_detail
 
+/* Best-effort preparation for ExactTile-Sparse v1.  Failure invalidates only
+ * the optional metadata and leaves the base hybrid tiles intact, so the next
+ * SpGEMM call can select the unchanged RTT path.  Main calls A-row setup in
+ * offline preprocessing and B-column setup after every structural rebuild;
+ * values-only B updates reuse the sums because masks are unchanged. */
+static inline bool gpu_prepare_low_fill_exact_tile_metadata(
+    DmmaOwnedDeviceTiles *tiles, bool build_row_sums, bool build_col_sums,
+    cudaStream_t stream = 0)
+{
+    if (tiles == nullptr || build_row_sums == build_col_sums ||
+        tiles->view.num_tiles < 0 ||
+        (build_row_sums && tiles->view.tile_row_ptr == nullptr) ||
+        (build_col_sums &&
+         (tiles->view.tile_col_ptr == nullptr ||
+          (tiles->view.num_tiles > 0 &&
+           (tiles->view.csc_tile_ids == nullptr ||
+            tiles->view.masks == nullptr)))) ||
+        (tiles->view.num_tiles > 0 && tiles->view.masks == nullptr))
+        return false;
+
+    uint32_t **owned = build_row_sums ? &tiles->row_tile_nnz_sum
+                                      : &tiles->col_tile_nnz_sum;
+    const int entries = build_row_sums ? tiles->view.tile_row_count
+                                       : tiles->view.tile_col_count;
+    cudaFree(*owned);
+    *owned = nullptr;
+    if (build_row_sums)
+    {
+        tiles->view.row_tile_nnz_sum = nullptr;
+        tiles->view.row_tile_nnz_sum_valid = false;
+    }
+    else
+    {
+        tiles->view.col_tile_nnz_sum = nullptr;
+        tiles->view.col_tile_nnz_sum_valid = false;
+    }
+    tiles->view.low_fill_metadata_overflow = false;
+
+    if (entries < 0 ||
+        static_cast<std::size_t>(entries) >
+            DMMA_LOW_FILL_METADATA_BUDGET_BYTES / sizeof(uint32_t))
+        return false;
+    if (entries == 0)
+    {
+        if (build_row_sums)
+            tiles->view.row_tile_nnz_sum_valid = true;
+        else
+            tiles->view.col_tile_nnz_sum_valid = true;
+        return true;
+    }
+
+    int *d_overflow = nullptr;
+    int h_overflow = 0;
+    if (!gpu_dmma_detail::device_allocate(
+            owned, static_cast<std::size_t>(entries),
+            build_row_sums ? "allocate low-fill A row sums"
+                           : "allocate low-fill B column sums") ||
+        !gpu_dmma_detail::device_allocate(
+            &d_overflow, 1, "allocate low-fill metadata overflow flag") ||
+        !dmma_cuda_ok(cudaMemsetAsync(d_overflow, 0, sizeof(int), stream),
+                      "clear low-fill metadata overflow flag"))
+        goto fallback;
+
+    gpu_dmma_detail::build_low_fill_tile_nnz_sum_kernel
+        <<<gpu_dmma_detail::block_count(
+               static_cast<std::size_t>(entries)),
+           gpu_dmma_detail::kThreads, 0, stream>>>(
+            tiles->view, build_col_sums ? 1 : 0, entries, *owned,
+            d_overflow);
+    if (!dmma_cuda_ok(cudaGetLastError(),
+                      "launch low-fill tile nnz sums") ||
+        !dmma_cuda_ok(cudaMemcpyAsync(
+                          &h_overflow, d_overflow, sizeof(int),
+                          cudaMemcpyDeviceToHost, stream),
+                      "read low-fill metadata overflow flag") ||
+        !dmma_cuda_ok(cudaStreamSynchronize(stream),
+                      "complete low-fill metadata construction"))
+        goto fallback;
+
+    cudaFree(d_overflow);
+    if (h_overflow != 0)
+    {
+        cudaFree(*owned);
+        *owned = nullptr;
+        tiles->view.low_fill_metadata_overflow = true;
+        return false;
+    }
+    if (build_row_sums)
+    {
+        tiles->view.row_tile_nnz_sum = *owned;
+        tiles->view.row_tile_nnz_sum_valid = true;
+    }
+    else
+    {
+        tiles->view.col_tile_nnz_sum = *owned;
+        tiles->view.col_tile_nnz_sum_valid = true;
+    }
+    return true;
+
+fallback:
+    cudaFree(d_overflow);
+    cudaFree(*owned);
+    *owned = nullptr;
+    cudaGetLastError();
+    return false;
+}
+
 static inline bool gpu_upload_csr(const SMatrix &host,
                                   DmmaOwnedDeviceCsr *out,
                                   double *h2d_ms = nullptr,
@@ -1526,6 +1748,15 @@ static inline bool gpu_update_dynamic_b_values(
         device_values, nnz, matrix, stats, stream);
 }
 
+static inline bool gpu_update_dynamic_b_values_with_policy(
+    const MAT_VAL_TYPE *device_values, int nnz, DmmaDynamicB *matrix,
+    DmmaBValuesClearPolicy policy, DmmaBValuesClearDecision *decision,
+    DmmaBUpdateStats *stats, cudaStream_t stream = 0)
+{
+    return gpu_dmma_detail::update_dynamic_b_values_with_policy(
+        device_values, nnz, matrix, policy, decision, stats, stream);
+}
+
 static inline bool gpu_compute_nnz_cub_ab(
     const DmmaDeviceCsrView &a, const DmmaDeviceCsrView &b,
     unsigned long long *nnz_cub, double *elapsed_ms,
@@ -1567,7 +1798,8 @@ static inline bool gpu_build_reordered_a_tiles(
 
 static inline bool gpu_prepare_reordered_a(
     const SMatrix &host, int dense_threshold, DmmaPreparedA *out,
-    DmmaOfflineAStats *stats, cudaStream_t stream = 0)
+    DmmaOfflineAStats *stats, cudaStream_t stream = 0,
+    const DmmaReorderConfig *reorder_config = nullptr)
 {
     if (out == nullptr || stats == nullptr || dense_threshold < 1 ||
         dense_threshold > DMMA_INPUT_ELEMS)
@@ -1584,7 +1816,7 @@ static inline bool gpu_prepare_reordered_a(
         if (!build_dmma_reorder_plan(
                 result.csr.rows, result.csr.cols, result.csr.nnz,
                 result.csr.row_ptr, result.csr.col_idx, dense_threshold,
-                &result.reorder, stream))
+                &result.reorder, stream, reorder_config))
             goto failure;
         stats->reorder_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - begin).count();

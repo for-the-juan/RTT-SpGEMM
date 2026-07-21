@@ -1,5 +1,6 @@
 #include "common.h"
 #include <cuda_runtime.h>
+#if CHECK_RESULT
 #include "external/cusparse/spgemm_cusparse.h"
 
 int spgemm_cu (         const int             mA,
@@ -100,3 +101,4 @@ static inline int spgemm_cu_device(
     printf("---------------------------------------------------------------\n");
     return validation_status;
 }
+#endif  // CHECK_RESULT
