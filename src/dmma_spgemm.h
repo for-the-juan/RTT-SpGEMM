@@ -231,6 +231,7 @@ struct DmmaSuper16IndexCache
     int device = -1;
     rtt::super16::OwnedDeviceIndex a_index;
     rtt::super16::OwnedDeviceIndex b_index;
+    bool last_prepare_cache_hit = false;
 
     bool prepare(const DmmaDeviceTiles &a, const DmmaDeviceTiles &b,
                  cudaStream_t stream)
@@ -243,6 +244,7 @@ struct DmmaSuper16IndexCache
                           b_row_ptr == b.tile_row_ptr &&
                           b_col_idx == b.tile_col_idx && a_index.valid() &&
                           b_index.valid();
+        last_prepare_cache_hit = same;
         if (same)
             return true;
         a_index.reset();
@@ -296,7 +298,9 @@ enum DmmaDirectNumericLayout
 {
     DMMA_DIRECT_NUMERIC_TILE_DYNAMIC = 0,
     DMMA_DIRECT_NUMERIC_ROW_STATIC = 1,
-    DMMA_DIRECT_NUMERIC_ROW_DYNAMIC = 2
+    DMMA_DIRECT_NUMERIC_ROW_DYNAMIC = 2,
+    /* Fixed persistent CTA/warp ownership with cyclic tile assignment. */
+    DMMA_DIRECT_NUMERIC_TILE_STATIC = 3
 };
 
 static inline const char *dmma_direct_numeric_layout_name(
@@ -308,6 +312,8 @@ static inline const char *dmma_direct_numeric_layout_name(
         return "row-static-block";
     case DMMA_DIRECT_NUMERIC_ROW_DYNAMIC:
         return "row-dynamic";
+    case DMMA_DIRECT_NUMERIC_TILE_STATIC:
+        return "tile-static";
     default:
         return "tile-dynamic";
     }
@@ -621,7 +627,8 @@ enum DmmaTailGateReason
     DMMA_TAIL_GATE_HEAVY_FRACTION = 4,
     DMMA_TAIL_GATE_REUSE_DISABLED = 5,
     DMMA_TAIL_GATE_OVERSIZED_SYMBOLIC = 6,
-    DMMA_TAIL_GATE_MAYBE_OVERFLOW = 7
+    DMMA_TAIL_GATE_MAYBE_OVERFLOW = 7,
+    DMMA_TAIL_GATE_PARENT_BUDGET = 8
 };
 
 static inline const char *dmma_tail_gate_reason_name(DmmaTailGateReason reason)
@@ -642,6 +649,8 @@ static inline const char *dmma_tail_gate_reason_name(DmmaTailGateReason reason)
         return "oversized-symbolic";
     case DMMA_TAIL_GATE_MAYBE_OVERFLOW:
         return "maybe-overflow";
+    case DMMA_TAIL_GATE_PARENT_BUDGET:
+        return "parent-budget";
     default:
         return "not-requested";
     }
@@ -666,6 +675,10 @@ struct DmmaSplitAsyncState;
 struct DmmaNumericScheduleConfig
 {
     bool tileflex16_symbolic = false;
+    /* Operand-side C16 structural views are produced with csr2tile.  They
+     * are immutable input format, never rebuilt or cached inside Core. */
+    rtt::super16::DeviceIndexView super16_a{};
+    rtt::super16::DeviceIndexView super16_b{};
     /* Cost-balanced is a direct-numeric scheduling wrapper.  It reorders
      * independent final C tasks by symbolic work and feeds the unchanged
      * hybrid-payload Tensor Core primitive from a persistent warp queue. */
@@ -788,6 +801,12 @@ struct DmmaNumericScheduleConfig
 
 struct DmmaSpGemmStats
 {
+    /* Wall-clock decomposition of the TileFlex16 path.  Index preparation is
+     * intentionally part of Core: on a single-shot A*B it includes all
+     * sidecar construction, allocation and waits. */
+    double super16_index_prepare_ms = 0.0;
+    double super16_parent_symbolic_wall_ms = 0.0;
+    bool super16_index_cache_hit = false;
     double candidate_ms = 0.0;
     double symbolic_ms = 0.0;
     double exact_kernel_ms = 0.0;
@@ -2727,6 +2746,93 @@ __global__ void dmma_tileflex_build_tail_records_kernel(
     tail_records[slot] = record;
 }
 
+/* Parent-coarse, child-exact tail admission.  step2 already produced one
+ * structural scan count and match count per C16 parent.  Cheap parents exit
+ * without touching leaf C tasks; only potential heavy parents refine their
+ * nonempty quadrants with the exact legacy C8 merge counts. */
+__global__ void dmma_tileflex_append_parent_tail_records_kernel(
+    DmmaDeviceTiles a, DmmaDeviceTiles b, std::uint64_t parent_count,
+    const std::uint64_t *__restrict__ parent_work,
+    const unsigned long long *__restrict__ parent_matches,
+    const std::uint64_t *__restrict__ parent_keys,
+    const unsigned long long *__restrict__ quadrant_masks,
+    const std::uint64_t *__restrict__ child_local_offsets,
+    const std::uint64_t *__restrict__ output_row_ptr,
+    float scan_cost, float match_cost, float admission_threshold,
+    float chunk_target, int max_chunks,
+    DmmaTailRecord *__restrict__ tail_records, int tail_capacity,
+    DmmaTailAppendState *__restrict__ tail_state)
+{
+    const std::uint64_t parent =
+        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (parent >= parent_count)
+        return;
+    const std::uint64_t key = parent_keys[parent];
+    const int parent_row = static_cast<int>(key >> 32);
+    const int parent_col =
+        static_cast<int>(static_cast<std::uint32_t>(key));
+    const std::uint64_t coarse_scans = parent_work[parent];
+    const unsigned long long coarse_matches = parent_matches[parent];
+    /* A 16x16 parent covers at most four C8 quadrants.  Use a conservative
+     * quarter threshold so no genuinely heavy child is discarded here. */
+    if (dmma_tail_fp32_work_from_counts(
+            static_cast<long long>(coarse_scans),
+            coarse_matches > static_cast<unsigned long long>(INT_MAX)
+                ? INT_MAX : static_cast<int>(coarse_matches),
+            scan_cost, match_cost) * 4.0f <= admission_threshold)
+        return;
+#pragma unroll
+    for (int quadrant = 0; quadrant < 4; ++quadrant)
+    {
+        if (quadrant_masks[parent * 4 + quadrant] == 0)
+            continue;
+        const int child_row = quadrant / 2;
+        const int child_col = quadrant % 2;
+        const int row = parent_row * 2 + child_row;
+        const int col = parent_col * 2 + child_col;
+        std::uint64_t local = child_local_offsets[parent * 2 + child_row];
+        if (child_col != 0 && quadrant_masks[parent * 4 + child_row * 2] != 0)
+            ++local;
+        const std::uint64_t task_wide = output_row_ptr[row] + local;
+        if (task_wide > static_cast<std::uint64_t>(INT_MAX))
+        {
+            atomicExch(&tail_state->overflow, 1);
+            continue;
+        }
+        const int task = static_cast<int>(task_wide);
+        int pa = a.tile_row_ptr[row];
+        const int a_end = a.tile_row_ptr[row + 1];
+        int pb = b.tile_col_ptr[col];
+        const int b_end = b.tile_col_ptr[col + 1];
+        int scans = 0;
+        int matches = 0;
+        while (pa < a_end && pb < b_end)
+        {
+            ++scans;
+            const int ka = a.tile_col_idx[pa];
+            const int kb = b.tile_row_idx[pb];
+            if (ka == kb) { ++matches; ++pa; ++pb; }
+            else if (ka < kb) ++pa;
+            else ++pb;
+        }
+        scans += (a_end - pa) + (b_end - pb);
+        const int chunks = dmma_tail_chunk_count_from_counts(
+            scans, matches, scan_cost, match_cost, admission_threshold,
+            chunk_target, max_chunks);
+        if (chunks <= 0)
+            continue;
+        const int slot = dmma_tail_try_reserve_record(tail_state, tail_capacity);
+        if (slot < 0)
+            continue;
+        DmmaTailRecord record;
+        record.id = task;
+        record.scans = scans;
+        record.matches = matches;
+        record.chunks = chunks;
+        tail_records[slot] = record;
+    }
+}
+
 /* Source-compatible coupled-threshold form retained for host tests and
  * callers that do not need the admission/chunk-target ablation. */
 static __host__ __device__ __forceinline__ int
@@ -4249,6 +4355,136 @@ __global__ void dmma_numeric_kernel(
     }
 #endif
 #endif
+}
+
+/* Flex-style execution unit: one CTA owns one structural C16 parent and its
+ * four warps consume the exact quadrant mask produced by symbolic step2.
+ * The child task IDs only address the temporary legacy export arrays; they
+ * do not define scheduling order. */
+template <bool ParentMajor>
+__global__ void dmma_numeric_c16_task_kernel(
+    DmmaDeviceTiles a, DmmaDeviceTiles b, std::uint64_t parent_count,
+    const int *__restrict__ parent_task_ids,
+    const std::uint64_t *__restrict__ parent_keys,
+    const unsigned long long *__restrict__ quadrant_masks,
+    const int *__restrict__ output_offsets, unsigned char *output_row_ptr,
+    unsigned char *output_col_idx, MAT_VAL_TYPE *output_values)
+{
+#if __CUDA_ARCH__ >= 800
+    namespace wmma = nvcuda::wmma;
+    const std::uint64_t task_wide =
+        (static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
+        WARP_SIZE;
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int local_warp = threadIdx.x / WARP_SIZE;
+    const std::uint64_t slot_count = parent_count * 4;
+    if (task_wide >= slot_count)
+        return;
+    /* Parent-major is the occupancy-matched tile-static ablation: one CTAs
+     * four warps are permanently assigned to one C16 parent. Q-major is the
+     * production tile-dynamic mapping. Grid size, occupancy and numeric
+     * primitive are otherwise identical. */
+    const std::uint64_t parent = ParentMajor ? task_wide / 4
+                                             : task_wide % parent_count;
+    const int quadrant = ParentMajor
+                             ? static_cast<int>(task_wide & 3ull)
+                             : static_cast<int>(task_wide / parent_count);
+    const int task = parent_task_ids[parent * 4 + quadrant];
+    if (task < 0)
+        return;
+
+    __shared__ MAT_VAL_TYPE shared_a[4 * DMMA_INPUT_ELEMS];
+    __shared__ MAT_VAL_TYPE shared_b[4 * DMMA_INPUT_ELEMS];
+    __shared__ MAT_VAL_TYPE shared_c[4 * DMMA_OUTPUT_ELEMS];
+    MAT_VAL_TYPE *tile_a_values = shared_a + local_warp * DMMA_INPUT_ELEMS;
+    MAT_VAL_TYPE *tile_b_values = shared_b + local_warp * DMMA_INPUT_ELEMS;
+    MAT_VAL_TYPE *tile_c_values = shared_c + local_warp * DMMA_OUTPUT_ELEMS;
+
+    wmma::fragment<wmma::matrix_a, DMMA_TILE_M, DMMA_TILE_N, DMMA_TILE_K,
+                   MAT_VAL_TYPE, wmma::row_major> fragment_a;
+    wmma::fragment<wmma::matrix_b, DMMA_TILE_M, DMMA_TILE_N, DMMA_TILE_K,
+                   MAT_VAL_TYPE, wmma::col_major> fragment_b;
+    wmma::fragment<wmma::accumulator, DMMA_TILE_M, DMMA_TILE_N, DMMA_TILE_K,
+                   MAT_VAL_TYPE> fragment_c;
+    wmma::fill_fragment(fragment_c, MAT_VAL_TYPE(0));
+
+    const std::uint64_t parent_key = parent_keys[parent];
+    const int tile_row = static_cast<int>(parent_key >> 32) * 2 +
+                         quadrant / 2;
+    const int tile_col = static_cast<int>(
+                             static_cast<std::uint32_t>(parent_key)) * 2 +
+                         quadrant % 2;
+    int pa = a.tile_row_ptr[tile_row];
+    const int a_end = a.tile_row_ptr[tile_row + 1];
+    int pb = b.tile_col_ptr[tile_col];
+    const int b_end = b.tile_col_ptr[tile_col + 1];
+    while (pa < a_end && pb < b_end)
+    {
+        const int ka = a.tile_col_idx[pa];
+        const int kb = b.tile_row_idx[pb];
+        if (ka == kb)
+        {
+            const int tile_b = b.csc_tile_ids[pb];
+            tile_a_values[lane] = dmma_decode_value(a, pa, lane);
+            tile_b_values[lane] = dmma_decode_value(b, tile_b, lane);
+            __syncwarp();
+            wmma::load_matrix_sync(fragment_a, tile_a_values, DMMA_TILE_K);
+            wmma::load_matrix_sync(fragment_b, tile_b_values, DMMA_TILE_K);
+            wmma::mma_sync(fragment_c, fragment_a, fragment_b, fragment_c);
+            __syncwarp();
+            ++pa;
+            ++pb;
+        }
+        else if (ka < kb)
+            ++pa;
+        else
+            ++pb;
+    }
+    wmma::store_matrix_sync(tile_c_values, fragment_c, DMMA_TILE_N,
+                            wmma::mem_row_major);
+    __syncwarp();
+    const uint64_t mask = quadrant_masks[parent * 4 + quadrant];
+    const int output_begin = output_offsets[task];
+    if (lane < DMMA_TILE_M)
+    {
+        const uint64_t preceding =
+            lane == 0 ? 0ull : mask & ((1ull << (lane * DMMA_TILE_N)) - 1ull);
+        output_row_ptr[task * DMMA_TILE_M + lane] =
+            static_cast<unsigned char>(__popcll(preceding));
+    }
+    for (int position = lane; position < DMMA_OUTPUT_ELEMS;
+         position += WARP_SIZE)
+    {
+        if ((mask & (1ull << position)) == 0)
+            continue;
+        const uint64_t lower =
+            position == 0 ? 0ull : mask & ((1ull << position) - 1ull);
+        const int rank = __popcll(lower);
+        output_col_idx[output_begin + rank] =
+            static_cast<unsigned char>(position % DMMA_TILE_N);
+        output_values[output_begin + rank] = tile_c_values[position];
+    }
+#endif
+}
+
+__global__ void dmma_export_c16_child_columns_kernel(
+    std::uint64_t parent_count,
+    const std::uint64_t *__restrict__ parent_keys,
+    const int *__restrict__ parent_task_ids, int *__restrict__ output_cols)
+{
+    const std::uint64_t parent =
+        static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (parent >= parent_count)
+        return;
+    const int parent_col =
+        static_cast<int>(static_cast<std::uint32_t>(parent_keys[parent]));
+#pragma unroll
+    for (int quadrant = 0; quadrant < 4; ++quadrant)
+    {
+        const int task = parent_task_ids[parent * 4 + quadrant];
+        if (task >= 0)
+            output_cols[task] = parent_col * 2 + quadrant % 2;
+    }
 }
 
 struct DmmaChunkDescriptor
@@ -6007,6 +6243,34 @@ __global__ void dmma_numeric_light_kernel(
         shared_c + local_warp * DMMA_OUTPUT_ELEMS);
 }
 
+/* Deliberately static tile baseline.  A fixed persistent warp owns the
+ * cyclic sequence worker, worker+W, ...; there is no queue or stealing.
+ * This keeps the per-tile Tensor Core primitive identical to tile-dynamic. */
+__global__ void dmma_numeric_tile_static_kernel(
+    DmmaDeviceTiles a, DmmaDeviceTiles b, int output_tile_count,
+    const int *__restrict__ output_rows, const int *__restrict__ output_cols,
+    const uint64_t *__restrict__ output_masks,
+    const int *__restrict__ output_offsets,
+    unsigned char *__restrict__ output_row_ptr,
+    unsigned char *__restrict__ output_col_idx,
+    MAT_VAL_TYPE *__restrict__ output_values)
+{
+    const int worker = static_cast<int>(dmma_global_thread_index() / WARP_SIZE);
+    const int workers = static_cast<int>(gridDim.x) * DMMA_WARPS_PER_BLOCK;
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int local_warp = threadIdx.x / WARP_SIZE;
+    __shared__ MAT_VAL_TYPE shared_a[DMMA_WARPS_PER_BLOCK * DMMA_INPUT_ELEMS];
+    __shared__ MAT_VAL_TYPE shared_b[DMMA_WARPS_PER_BLOCK * DMMA_INPUT_ELEMS];
+    __shared__ MAT_VAL_TYPE shared_c[DMMA_WARPS_PER_BLOCK * DMMA_OUTPUT_ELEMS];
+    for (int task = worker; task < output_tile_count; task += workers)
+        dmma_numeric_regular_task(
+            a, b, output_tile_count, output_rows, output_cols, output_masks,
+            output_offsets, output_row_ptr, output_col_idx, output_values,
+            task, lane, shared_a + local_warp * DMMA_INPUT_ELEMS,
+            shared_b + local_warp * DMMA_INPUT_ELEMS,
+            shared_c + local_warp * DMMA_OUTPUT_ELEMS);
+}
+
 /* The prefix contains no admitted heavy parent after exact output-window
  * filtering, so it preserves a branch-free four-warps-per-CTA bulk grid. */
 __global__ void dmma_numeric_prefix_kernel(
@@ -6772,7 +7036,9 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
          schedule.direct_numeric_layout !=
              DMMA_DIRECT_NUMERIC_ROW_STATIC &&
          schedule.direct_numeric_layout !=
-             DMMA_DIRECT_NUMERIC_ROW_DYNAMIC) ||
+             DMMA_DIRECT_NUMERIC_ROW_DYNAMIC &&
+         schedule.direct_numeric_layout !=
+             DMMA_DIRECT_NUMERIC_TILE_STATIC) ||
         (schedule.mode != DMMA_SCHEDULE_DIRECT &&
          schedule.direct_numeric_layout !=
              DMMA_DIRECT_NUMERIC_TILE_DYNAMIC) ||
@@ -6999,6 +7265,14 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     int *d_output_nnz = nullptr;
     int *d_output_row_ptr = nullptr;
     std::uint64_t *d_output_numeric_work = nullptr;
+    int *d_c16_parent_task_ids = nullptr;
+    const std::uint64_t *d_c16_parent_keys = nullptr;
+    const unsigned long long *d_c16_quadrant_masks = nullptr;
+    const std::uint64_t *d_c16_parent_work = nullptr;
+    const unsigned long long *d_c16_parent_matches = nullptr;
+    const std::uint64_t *d_c16_child_local_offsets = nullptr;
+    const std::uint64_t *d_c16_output_row_ptr64 = nullptr;
+    std::uint64_t c16_parent_task_count = 0;
     std::uint64_t *d_cost_sort_keys = nullptr;
     int *d_cost_task_order = nullptr;
     int *d_cost_queue_head = nullptr;
@@ -7061,6 +7335,9 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     bool row_dynamic_requested =
         use_direct_numeric && !row_dynamic_auto_requested &&
         schedule.direct_numeric_layout == DMMA_DIRECT_NUMERIC_ROW_DYNAMIC;
+    const bool tile_static_requested =
+        use_direct_numeric && !row_dynamic_auto_requested &&
+        schedule.direct_numeric_layout == DMMA_DIRECT_NUMERIC_TILE_STATIC;
     bool row_worker_requested =
         row_dynamic_auto_requested || row_static_requested ||
         row_dynamic_requested;
@@ -7199,7 +7476,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
                          "tile-tail/early-split with static light policy.\n");
             goto failure;
         }
-        static DmmaSuper16IndexCache cache;
         static DmmaTileFlexTailHostCache tail_cache;
         const bool tileflex_tail_cache_enabled = [] {
             const char *value = std::getenv("RTT_TILEFLEX_TAIL_CACHE");
@@ -7215,14 +7491,28 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
             tileflex_tail_cache_enabled && collect_sparse_tail_records &&
             tail_cache.matches(a, b, tileflex_device, schedule,
                                resolved_chunk_target);
-        if (!cache.prepare(a, b, nullptr) ||
-            !rtt::super16::run_parent_symbolic(
-                a, b, cache.a_index.view(), cache.b_index.view(), nullptr,
+        if (schedule.super16_a.row_ptr == nullptr ||
+            schedule.super16_b.row_ptr == nullptr ||
+            schedule.super16_b.col_ptr == nullptr)
+        {
+            std::fprintf(stderr,
+                         "tileflex16 requires csr2tile-owned C16 views.\n");
+            goto failure;
+        }
+        stats->super16_index_prepare_ms = 0.0;
+        stats->super16_index_cache_hit = false;
+        const auto super16_symbolic_begin = std::chrono::steady_clock::now();
+        if (!rtt::super16::run_parent_symbolic(
+                a, b, schedule.super16_a, schedule.super16_b, nullptr,
                 &super16_output,
                 schedule.cost_balanced ||
-                    (collect_sparse_tail_records &&
-                     !tileflex_tail_cache_hit)))
+                    (collect_sparse_tail_records && !tileflex_tail_cache_hit),
+                true))
             goto failure;
+        const auto super16_symbolic_end = std::chrono::steady_clock::now();
+        stats->super16_parent_symbolic_wall_ms =
+            std::chrono::duration<double, std::milli>(
+                super16_symbolic_end - super16_symbolic_begin).count();
         d_output_row_ptr = super16_output.native.row_ptr.release();
         d_output_rows = super16_output.native.rows.release();
         d_output_cols = super16_output.native.cols.release();
@@ -7230,6 +7520,19 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
         d_output_nnz = super16_output.native.nnz_offsets.release();
         d_output_numeric_work =
             super16_output.native.numeric_work.release();
+        d_c16_parent_task_ids =
+            super16_output.native.parent_task_ids.release();
+        c16_parent_task_count =
+            super16_output.metrics.parent_c_candidates;
+        d_c16_parent_keys = super16_output.candidates.keys.get();
+        d_c16_quadrant_masks =
+            super16_output.exact.parent_quadrant_masks.get();
+        d_c16_parent_work = super16_output.exact.plan.owner_work.get();
+        d_c16_parent_matches =
+            super16_output.exact.matched_k_parents.get();
+        d_c16_child_local_offsets =
+            super16_output.native.child_local_offsets.get();
+        d_c16_output_row_ptr64 = super16_output.native.row_ptr64.get();
         output_tile_count = super16_output.native.tile_count;
         output_nnz = super16_output.native.nnz;
         stats->candidate_ms = super16_output.metrics.candidate_queue_ms;
@@ -7241,7 +7544,47 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
             super16_output.metrics.parent_c_candidates;
         stats->output_tiles = output_tile_count;
         stats->output_nnz = output_nnz;
-        if (collect_sparse_tail_records && output_tile_count > 0)
+        std::printf(
+            "SUPER16_STRUCTURE sum_k_products=%llu "
+            "unique_parent_C16=%llu nonempty_parent_C16=%llu "
+            "empty_parent_C16=%llu nonempty_child_C8=%llu "
+            "step2_parent_invocations=%llu invariants_valid=%d\n",
+            static_cast<unsigned long long>(
+                super16_output.metrics.raw_candidate_pairs),
+            static_cast<unsigned long long>(
+                super16_output.metrics.parent_c_candidates),
+            static_cast<unsigned long long>(
+                super16_output.metrics.nonempty_parent_c),
+            static_cast<unsigned long long>(
+                super16_output.metrics.empty_parent_c),
+            static_cast<unsigned long long>(
+                super16_output.metrics.final_leaf_c_tiles),
+            static_cast<unsigned long long>(
+                super16_output.metrics.step2_parent_invocations),
+            super16_output.metrics.nonempty_parent_c <=
+                        super16_output.metrics.final_leaf_c_tiles &&
+                    super16_output.metrics.final_leaf_c_tiles <=
+                        4 * super16_output.metrics.nonempty_parent_c &&
+                    super16_output.metrics.step2_parent_invocations ==
+                        super16_output.metrics.parent_c_candidates
+                ? 1
+                : 0);
+        /* Matrix-level admission budget derived entirely from step1/step2
+         * counters already resident on the host.  It prevents the expensive
+         * child-quadrant replay on path-explosive or enormous parent graphs,
+         * while retaining the observed profitable small-tail regime. */
+        constexpr std::uint64_t kTailParentBudget = 16ull * 1000 * 1000;
+        constexpr std::uint64_t kTailPathExpansionBudget = 16;
+        const std::uint64_t tail_parent_count =
+            super16_output.metrics.parent_c_candidates;
+        const std::uint64_t tail_raw_pairs =
+            super16_output.metrics.raw_candidate_pairs;
+        const bool tail_parent_budget_pass =
+            tail_parent_count <= kTailParentBudget &&
+            (tail_parent_count == 0 ||
+             tail_raw_pairs <= tail_parent_count * kTailPathExpansionBudget);
+        if (collect_sparse_tail_records && output_tile_count > 0 &&
+            tail_parent_budget_pass)
         {
             timeval tail_begin{}, tail_end{};
             gettimeofday(&tail_begin, nullptr);
@@ -7273,7 +7616,10 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
                     : 0;
             if (tail_record_capacity <= 0 ||
                 (!tileflex_tail_cache_hit &&
-                 d_output_numeric_work == nullptr) ||
+                 (d_c16_parent_work == nullptr ||
+                  d_c16_parent_matches == nullptr ||
+                  d_c16_child_local_offsets == nullptr ||
+                  d_c16_output_row_ptr64 == nullptr)) ||
                 !dmma_cuda_ok(cudaMalloc(
                                   reinterpret_cast<void **>(&d_tail_records),
                                   tileflex_tail_cache_hit
@@ -7324,7 +7670,7 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
             {
             unsigned int tail_blocks = 0;
             if (!dmma_launch_blocks(
-                    static_cast<std::size_t>(output_tile_count), 256,
+                    static_cast<std::size_t>(c16_parent_task_count), 256,
                     &tail_blocks, "TileFlex tail admission"))
                 goto symbolic_failure;
             /* TileFlex needs no loose maybe-ID pass, but the borrowed split
@@ -7340,8 +7686,12 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
                                    split_async.admission_count_start, 0),
                                "record TileFlex tail admission start")))
                 goto symbolic_failure;
-            dmma_tileflex_build_tail_records_kernel<<<tail_blocks, 256>>>(
-                output_tile_count, d_output_numeric_work,
+            dmma_tileflex_append_parent_tail_records_kernel
+                <<<tail_blocks, 256>>>(
+                a, b, c16_parent_task_count, d_c16_parent_work,
+                d_c16_parent_matches, d_c16_parent_keys,
+                d_c16_quadrant_masks, d_c16_child_local_offsets,
+                d_c16_output_row_ptr64,
                 static_cast<float>(schedule.cost.scan),
                 static_cast<float>(schedule.cost.match),
                 static_cast<float>(schedule.split_threshold),
@@ -7423,6 +7773,34 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
             gettimeofday(&tail_end, nullptr);
             stats->symbolic_finalize_ms +=
                 dmma_elapsed_ms(tail_begin, tail_end);
+        }
+        else if (collect_sparse_tail_records && output_tile_count > 0)
+        {
+            stats->tail_gate_reason = DMMA_TAIL_GATE_PARENT_BUDGET;
+            /* Preserve the split-context timing ABI even though no admission
+             * kernel is launched.  Both intervals are valid empty events. */
+            if (admission_events_ready &&
+                (!dmma_cuda_ok(cudaEventRecord(
+                                   split_async.admission_filter_start, 0),
+                               "record budget filter start") ||
+                 !dmma_cuda_ok(cudaEventRecord(
+                                   split_async.admission_filter_stop, 0),
+                               "record budget filter stop") ||
+                 !dmma_cuda_ok(cudaEventRecord(
+                                   split_async.admission_count_start, 0),
+                               "record budget count start") ||
+                 !dmma_cuda_ok(cudaEventRecord(
+                                   split_async.admission_count_stop, 0),
+                               "record budget count stop")))
+                goto symbolic_failure;
+            admission_count_event_recorded = admission_events_ready;
+            std::printf(
+                "DMMA_TAIL_PARENT_BUDGET parents=%llu raw_pairs=%llu "
+                "parent_cap=%llu path_expansion_cap=%llu pass=0\n",
+                static_cast<unsigned long long>(tail_parent_count),
+                static_cast<unsigned long long>(tail_raw_pairs),
+                static_cast<unsigned long long>(kTailParentBudget),
+                static_cast<unsigned long long>(kTailPathExpansionBudget));
         }
         goto numeric_phase;
     }
@@ -9953,7 +10331,12 @@ numeric_phase:
 #endif
     gettimeofday(&begin, nullptr);
     {
-        if (!row_worker_requested && numeric_blocks == 0 &&
+        const bool c16_parent_direct =
+            schedule.tileflex16_symbolic && use_direct_numeric &&
+            !schedule.cost_balanced && !row_worker_requested &&
+            d_c16_parent_task_ids != nullptr;
+        if (!c16_parent_direct && !row_worker_requested &&
+            numeric_blocks == 0 &&
             !dmma_launch_blocks(
                 static_cast<std::size_t>(output_tile_count),
                 DMMA_WARPS_PER_BLOCK, &numeric_blocks,
@@ -9987,7 +10370,37 @@ numeric_phase:
             }
             else
             {
-                if (stats->low_fill_exact_tile_used)
+                if (tile_static_requested)
+                {
+                    if (!dmma_launch_blocks(
+                            static_cast<std::size_t>(c16_parent_task_count) * 4,
+                            DMMA_WARPS_PER_BLOCK, &numeric_blocks,
+                            "C16 parent-major tile-static numeric"))
+                        goto numeric_failure;
+                    dmma_numeric_c16_task_kernel<true>
+                        <<<numeric_blocks, DMMA_THREADS_PER_BLOCK>>>(
+                            a, b, c16_parent_task_count,
+                            d_c16_parent_task_ids, d_c16_parent_keys,
+                            d_c16_quadrant_masks, d_output_nnz,
+                            d_output_tile_row_ptr, d_output_value_cols,
+                            d_output_values);
+                }
+                else if (c16_parent_direct)
+                {
+                    if (!dmma_launch_blocks(
+                            static_cast<std::size_t>(c16_parent_task_count) * 4,
+                            DMMA_WARPS_PER_BLOCK, &numeric_blocks,
+                            "C16-driven tile-dynamic numeric"))
+                        goto numeric_failure;
+                    dmma_numeric_c16_task_kernel<false>
+                        <<<numeric_blocks, DMMA_THREADS_PER_BLOCK>>>(
+                            a, b, c16_parent_task_count,
+                            d_c16_parent_task_ids, d_c16_parent_keys,
+                            d_c16_quadrant_masks, d_output_nnz,
+                            d_output_tile_row_ptr, d_output_value_cols,
+                            d_output_values);
+                }
+                else if (stats->low_fill_exact_tile_used)
                     dmma_numeric_low_fill_exact_tile_kernel
                         <<<numeric_blocks, DMMA_THREADS_PER_BLOCK>>>(
                             a, b, output_tile_count, d_output_rows,
@@ -10885,6 +11298,29 @@ numeric_phase:
     if (schedule.materialize_output)
     {
         gettimeofday(&begin, nullptr);
+        if (d_output_cols == nullptr && output_tile_count > 0)
+        {
+            unsigned int export_blocks = 0;
+            if (d_c16_parent_keys == nullptr ||
+                d_c16_parent_task_ids == nullptr ||
+                !dmma_launch_blocks(
+                    static_cast<std::size_t>(c16_parent_task_count), 256,
+                    &export_blocks, "export C16 child columns") ||
+                !dmma_cuda_ok(cudaMalloc(
+                                  reinterpret_cast<void **>(&d_output_cols),
+                                  static_cast<std::size_t>(output_tile_count) *
+                                      sizeof(int)),
+                              "allocate post-Core C8 column export"))
+                goto numeric_failure;
+            dmma_export_c16_child_columns_kernel<<<export_blocks, 256>>>(
+                c16_parent_task_count, d_c16_parent_keys,
+                d_c16_parent_task_ids, d_output_cols);
+            if (!dmma_cuda_ok(cudaGetLastError(),
+                              "launch post-Core C8 column export") ||
+                !dmma_cuda_ok(cudaDeviceSynchronize(),
+                              "complete post-Core C8 column export"))
+                goto numeric_failure;
+        }
         if (!dmma_copy_output_to_host(
                 a.rows, b.cols, a.tile_row_count,
                 b.tile_col_count, output_tile_count, output_nnz,
@@ -10938,6 +11374,7 @@ numeric_phase:
     cudaFree(d_output_nnz);
     cudaFree(d_output_row_ptr);
     cudaFree(d_output_numeric_work);
+    cudaFree(d_c16_parent_task_ids);
     cudaFree(d_candidate_row_ptr);
     cudaFree(d_candidate_rows);
     cudaFree(d_candidate_cols);
@@ -11007,6 +11444,7 @@ symbolic_cleanup:
     cudaFree(d_output_nnz);
     cudaFree(d_output_row_ptr);
     cudaFree(d_output_numeric_work);
+    cudaFree(d_c16_parent_task_ids);
 failure:
     cudaFree(d_row_worker_sm_ids);
     cudaFree(d_row_dynamic_next_row);

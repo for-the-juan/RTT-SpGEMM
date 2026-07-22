@@ -242,7 +242,11 @@ private:
     static bool cache_enabled()
     {
         const char *value = std::getenv("RTT_SUPER16_BUFFER_CACHE");
-        return value == nullptr || std::strcmp(value, "0") != 0;
+        /* Single-shot is the production/default contract.  The async pool
+         * has a 7--10 ms first-use tax on A100 and retained blocks also make
+         * repeated minima a steady-state measurement.  Enable that mode
+         * only for an explicitly labelled reuse experiment. */
+        return value != nullptr && std::strcmp(value, "1") == 0;
     }
 
     using CacheEntry = std::pair<T *, std::uint64_t>;
@@ -365,6 +369,9 @@ struct SymbolicMetrics
     std::uint64_t raw_candidate_pairs = 0;
     std::uint64_t parent_c_candidates = 0;
     std::uint64_t final_leaf_c_tiles = 0;
+    std::uint64_t nonempty_parent_c = 0;
+    std::uint64_t empty_parent_c = 0;
+    std::uint64_t step2_parent_invocations = 0;
     std::uint64_t candidate_bitmap_batch_count = 0;
     std::uint64_t candidate_bitmap_words_per_row = 0;
     std::size_t candidate_bitmap_bytes = 0;
@@ -514,6 +521,8 @@ public:
         masks.reset();
         nnz_offsets.reset();
         numeric_work.reset();
+        parent_task_ids.reset();
+        child_local_offsets.reset();
     }
 
     int leaf_row_count = 0;
@@ -534,6 +543,13 @@ public:
      * final native C tile arrays.  It is metadata only; numeric continues to
      * decode the original hybrid A/B payloads. */
     DeviceBuffer<std::uint64_t> numeric_work;
+    /* Four child-task IDs per C16 parent candidate.  Empty quadrants remain
+     * -1.  This lets numeric consume the parent work item directly while the
+     * legacy C8 arrays are temporarily retained for CSR export. */
+    DeviceBuffer<int> parent_task_ids;
+    /* Finalize already needs two row-local offsets per parent.  Tail
+     * admission reuses this workspace to derive sparse child task IDs. */
+    DeviceBuffer<std::uint64_t> child_local_offsets;
 };
 
 /* Parent-level symbolic result.  Native 8x8 leaf finalization is deliberately
@@ -789,6 +805,133 @@ __global__ void make_leaf_records_kernel(
         (leaf.tile_row_ptr[0] != 0 ||
          leaf.tile_row_ptr[leaf.tile_row_count] != leaf.num_tiles))
         atomicCAS(error, 0, 3);
+}
+
+/* Direct dual-view builder.  The production leaf CSR is already sorted by
+ * leaf column within each row.  A 16x16 parent row is therefore only a
+ * 2-way (A8x4) or 4-way (B4x8) merge; a global leaf-record radix sort is
+ * unnecessary. */
+__global__ void count_parent_columns_from_leaf_csr_kernel(
+    DmmaDeviceTiles leaf, std::uint32_t row_group, std::uint32_t col_group,
+    std::uint32_t parent_rows, std::uint64_t *row_counts)
+{
+    for (std::uint32_t parent_row = blockIdx.x * blockDim.x + threadIdx.x;
+         parent_row < parent_rows;
+         parent_row += static_cast<std::uint32_t>(gridDim.x * blockDim.x))
+    {
+        int cursor[4] = {};
+        int end[4] = {};
+#pragma unroll
+        for (int child = 0; child < 4; ++child)
+        {
+            const std::uint32_t leaf_row = parent_row * row_group + child;
+            if (child < static_cast<int>(row_group) &&
+                leaf_row < static_cast<std::uint32_t>(leaf.tile_row_count))
+            {
+                cursor[child] = leaf.tile_row_ptr[leaf_row];
+                end[child] = leaf.tile_row_ptr[leaf_row + 1];
+            }
+        }
+        std::uint64_t count = 0;
+        while (true)
+        {
+            int next_parent_col = INT_MAX;
+#pragma unroll
+            for (int child = 0; child < 4; ++child)
+                if (child < static_cast<int>(row_group) &&
+                    cursor[child] < end[child])
+                    next_parent_col = min(
+                        next_parent_col,
+                        leaf.tile_col_idx[cursor[child]] /
+                            static_cast<int>(col_group));
+            if (next_parent_col == INT_MAX)
+                break;
+            ++count;
+#pragma unroll
+            for (int child = 0; child < 4; ++child)
+                if (child < static_cast<int>(row_group))
+                    while (cursor[child] < end[child] &&
+                           leaf.tile_col_idx[cursor[child]] /
+                                   static_cast<int>(col_group) ==
+                               next_parent_col)
+                        ++cursor[child];
+        }
+        row_counts[parent_row] = count;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        row_counts[parent_rows] = 0;
+}
+
+__global__ void fill_parent_view_from_leaf_csr_kernel(
+    DmmaDeviceTiles leaf, std::uint32_t row_group, std::uint32_t col_group,
+    std::uint32_t parent_rows, const std::uint64_t *parent_row_ptr,
+    std::uint32_t *parent_col_idx, std::uint64_t *child_ptr,
+    std::uint8_t *child_mask, std::uint32_t *child_leaf_ids)
+{
+    for (std::uint32_t parent_row = blockIdx.x * blockDim.x + threadIdx.x;
+         parent_row < parent_rows;
+         parent_row += static_cast<std::uint32_t>(gridDim.x * blockDim.x))
+    {
+        int cursor[4] = {};
+        int end[4] = {};
+#pragma unroll
+        for (int child = 0; child < 4; ++child)
+        {
+            const std::uint32_t leaf_row = parent_row * row_group + child;
+            if (child < static_cast<int>(row_group) &&
+                leaf_row < static_cast<std::uint32_t>(leaf.tile_row_count))
+            {
+                cursor[child] = leaf.tile_row_ptr[leaf_row];
+                end[child] = leaf.tile_row_ptr[leaf_row + 1];
+            }
+        }
+        std::uint64_t parent_id = parent_row_ptr[parent_row];
+        std::uint64_t child_output =
+            leaf.tile_row_ptr[min(parent_row * row_group,
+                                  static_cast<std::uint32_t>(
+                                      leaf.tile_row_count))];
+        while (true)
+        {
+            int next_parent_col = INT_MAX;
+#pragma unroll
+            for (int child = 0; child < 4; ++child)
+                if (child < static_cast<int>(row_group) &&
+                    cursor[child] < end[child])
+                    next_parent_col = min(
+                        next_parent_col,
+                        leaf.tile_col_idx[cursor[child]] /
+                            static_cast<int>(col_group));
+            if (next_parent_col == INT_MAX)
+                break;
+            parent_col_idx[parent_id] =
+                static_cast<std::uint32_t>(next_parent_col);
+            child_ptr[parent_id] = child_output;
+            std::uint8_t occupied = 0;
+#pragma unroll
+            for (int child = 0; child < 4; ++child)
+            {
+                if (child >= static_cast<int>(row_group))
+                    continue;
+                while (cursor[child] < end[child] &&
+                       leaf.tile_col_idx[cursor[child]] /
+                               static_cast<int>(col_group) ==
+                           next_parent_col)
+                {
+                    const int leaf_id = cursor[child]++;
+                    const int leaf_col = leaf.tile_col_idx[leaf_id];
+                    const int slot = child * static_cast<int>(col_group) +
+                                     leaf_col % static_cast<int>(col_group);
+                    occupied = static_cast<std::uint8_t>(
+                        occupied | static_cast<std::uint8_t>(1u << slot));
+                    child_leaf_ids[child_output++] =
+                        static_cast<std::uint32_t>(leaf_id);
+                }
+            }
+            child_mask[parent_id] = occupied;
+            ++parent_id;
+        }
+        child_ptr[parent_id] = child_output;
+    }
 }
 
 __global__ void mark_parent_heads_kernel(const LeafRecord *records,
@@ -1052,7 +1195,8 @@ __global__ void candidate_owner_work_kernel(
 /* TileSpGEMM/FlexSpGEMM step1: one warp owns one 16x16 parent row and
  * accumulates its candidate columns in a 512-word shared-memory SPA. */
 __global__ void tile_step1_spa_count_kernel(
-    DeviceIndexView a, DeviceIndexView b, std::uint64_t *candidate_row_counts)
+    DeviceIndexView a, DeviceIndexView b, std::uint64_t *candidate_row_counts,
+    unsigned long long *raw_pair_count)
 {
     const unsigned int global_warp =
         (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -1066,10 +1210,13 @@ __global__ void tile_step1_spa_count_kernel(
     for (unsigned int word = lane; word < words; word += 32)
         local[word] = 0;
     __syncwarp();
+    unsigned long long row_pairs = 0;
     for (std::uint64_t ai = a.row_ptr[global_warp];
          ai < a.row_ptr[global_warp + 1]; ++ai)
     {
         const std::uint32_t k = a.col_idx[ai];
+        if (lane == 0)
+            row_pairs += b.row_ptr[k + 1] - b.row_ptr[k];
         for (std::uint64_t bi = b.row_ptr[k] + lane;
              bi < b.row_ptr[k + 1]; bi += 32)
         {
@@ -1083,7 +1230,10 @@ __global__ void tile_step1_spa_count_kernel(
         count += __popc(local[word]);
     count = __reduce_add_sync(0xffffffffu, count);
     if (lane == 0)
+    {
         candidate_row_counts[global_warp] = count;
+        atomicAdd(raw_pair_count, row_pairs);
+    }
 }
 
 __global__ void tile_step1_spa_fill_kernel(
@@ -2530,7 +2680,8 @@ __global__ void tile_finalize_row_counts_kernel(
     const std::uint64_t *candidate_keys,
     const unsigned long long *quadrant_masks,
     std::uint64_t *candidate_child_local_offsets,
-    std::uint64_t *native_row_counts, int *error)
+    std::uint64_t *native_row_counts,
+    unsigned long long *nonempty_parent_count, int *error)
 {
     const std::uint32_t parent_row = blockIdx.x;
     if (parent_row >= parent_row_count)
@@ -2582,6 +2733,8 @@ __global__ void tile_finalize_row_counts_kernel(
                 bottom += bottom_valid && col0 + 1 < static_cast<std::uint64_t>(leaf_col_count) &&
                           quadrant_masks[candidate * 4 + 3] != 0;
             }
+            if ((top + bottom) != 0)
+                atomicAdd(nonempty_parent_count, 1ull);
         }
         unsigned int top_scan = top;
         unsigned int bottom_scan = bottom;
@@ -2682,7 +2835,8 @@ __global__ void fill_native_output_kernel(
     const unsigned long long *quadrant_masks,
     const std::uint64_t *candidate_child_local_offsets,
     const std::uint64_t *native_row_ptr, int *output_rows, int *output_cols,
-    std::uint64_t *output_masks, int *output_nnz, int *error)
+    std::uint64_t *output_masks, int *output_nnz, int *parent_task_ids,
+    int *error)
 {
     const std::uint64_t stride =
         static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
@@ -2724,10 +2878,16 @@ __global__ void fill_native_output_kernel(
                     atomicCAS(error, 0, 55);
                     continue;
                 }
-                output_rows[output] = static_cast<int>(native_row);
-                output_cols[output] = static_cast<int>(native_col);
-                output_masks[output] = mask;
+                if (output_rows != nullptr)
+                    output_rows[output] = static_cast<int>(native_row);
+                if (output_cols != nullptr)
+                    output_cols[output] = static_cast<int>(native_col);
+                if (output_masks != nullptr)
+                    output_masks[output] = mask;
                 output_nnz[output] = __popcll(mask);
+                if (parent_task_ids != nullptr)
+                    parent_task_ids[candidate * 4 + quadrant] =
+                        static_cast<int>(output);
                 ++local;
             }
         }
@@ -2995,82 +3155,30 @@ inline bool build_device_index(const DmmaDeviceTiles &leaf, OperandRole role,
     result.metadata_.parent_row_count = parent_rows;
     result.metadata_.parent_col_count = parent_cols;
 
-    DeviceBuffer<detail::LeafRecord> records;
-    DeviceBuffer<int> heads;
-    DeviceBuffer<int> parent_ids;
     DeviceBuffer<int> error;
-    if (!records.allocate(static_cast<std::uint64_t>(leaf.num_tiles),
-                          "allocate Super16 leaf records") ||
-        !heads.allocate(static_cast<std::uint64_t>(leaf.num_tiles),
-                        "allocate Super16 parent heads") ||
-        !parent_ids.allocate(static_cast<std::uint64_t>(leaf.num_tiles),
-                             "allocate Super16 parent IDs") ||
-        !error.allocate(1, "allocate Super16 error flag") ||
+    if (!error.allocate(1, "allocate Super16 error flag") ||
         !detail::cuda_ok(cudaMemsetAsync(error.get(), 0, sizeof(int), stream),
                          "clear Super16 error flag"))
         return false;
-
-    const unsigned int row_blocks = std::max(
-        1u,
-        detail::build_blocks(static_cast<std::uint64_t>(leaf.tile_row_count)));
-    detail::make_leaf_records_kernel<<<row_blocks, kBuildThreads, 0, stream>>>(
-        leaf, role, parent_cols, records.get(), error.get());
-    if (!detail::cuda_ok(cudaGetLastError(),
-                         "launch Super16 leaf record build") ||
-        !detail::sync_and_read_error(stream, error.get(),
-                                     "validate Super16 leaf CSR"))
-        return false;
-
-    std::uint32_t parent_count = 0;
-    if (leaf.num_tiles > 0)
-    {
-        try
-        {
-            auto policy = thrust::cuda::par.on(stream);
-            thrust::device_ptr<detail::LeafRecord> record_ptr(records.get());
-            thrust::sort(policy, record_ptr, record_ptr + leaf.num_tiles,
-                         detail::LeafRecordLess{});
-            const unsigned int blocks = detail::build_blocks(leaf.num_tiles);
-            detail::mark_parent_heads_kernel<<<blocks, kBuildThreads, 0, stream>>>(
-                records.get(), leaf.num_tiles, heads.get());
-            if (!detail::cuda_ok(cudaGetLastError(),
-                                 "launch Super16 parent head marking"))
-                return false;
-            thrust::device_ptr<int> head_ptr(heads.get());
-            thrust::device_ptr<int> id_ptr(parent_ids.get());
-            thrust::exclusive_scan(policy, head_ptr, head_ptr + leaf.num_tiles,
-                                   id_ptr);
-            const int host_parent_count = thrust::reduce(
-                policy, head_ptr, head_ptr + leaf.num_tiles, 0,
-                thrust::plus<int>());
-            if (host_parent_count < 0)
-                return false;
-            parent_count = static_cast<std::uint32_t>(host_parent_count);
-        }
-        catch (const std::exception &exception)
-        {
-            std::fprintf(stderr, "Thrust error building Super16 parents: %s\n",
-                         exception.what());
-            cudaGetLastError();
-            return false;
-        }
-    }
-    result.metadata_.parent_count = parent_count;
-
+    const std::uint64_t parent_capacity =
+        static_cast<std::uint64_t>(leaf.num_tiles);
+    /* Allocate the direct builder's upper-bound arena before launching any
+     * count/scan work.  cudaMalloc between count and fill is synchronizing
+     * and previously serialized the whole stream several times. */
     if (!result.row_ptr_.allocate(static_cast<std::uint64_t>(parent_rows) + 1,
                                   "allocate Super16 parent row pointer") ||
-        !result.col_idx_.allocate(parent_count,
-                                  "allocate Super16 parent columns") ||
-        !result.child_ptr_.allocate(static_cast<std::uint64_t>(parent_count) + 1,
-                                    "allocate Super16 child pointer") ||
-        !result.child_mask_.allocate(parent_count,
-                                     "allocate Super16 child masks") ||
+        !result.col_idx_.allocate(parent_capacity,
+                                  "allocate direct Super16 parent columns") ||
+        !result.child_ptr_.allocate(parent_capacity + 1,
+                                    "allocate direct Super16 child pointer") ||
+        !result.child_mask_.allocate(parent_capacity,
+                                     "allocate direct Super16 child masks") ||
         !result.child_leaf_ids_.allocate(
             static_cast<std::uint64_t>(leaf.num_tiles),
-            "allocate Super16 child leaf IDs") ||
+            "allocate direct Super16 child leaf IDs") ||
         !result.boolean_row_masks_.allocate(
-            static_cast<std::uint64_t>(parent_count) * 16,
-            "allocate Super16 parent Boolean rows") ||
+            parent_capacity * 16,
+            "allocate direct Super16 parent Boolean rows") ||
         !detail::cuda_ok(cudaMemsetAsync(
                              result.row_ptr_.get(), 0,
                              (static_cast<std::size_t>(parent_rows) + 1) *
@@ -3078,42 +3186,22 @@ inline bool build_device_index(const DmmaDeviceTiles &leaf, OperandRole role,
                              stream),
                          "clear Super16 parent row pointer"))
         return false;
-
-    if (leaf.num_tiles > 0)
-    {
-        const unsigned int blocks = detail::build_blocks(leaf.num_tiles);
-        detail::fill_parent_arrays_kernel<<<blocks, kBuildThreads, 0, stream>>>(
-            records.get(), parent_ids.get(), leaf.num_tiles, parent_cols,
-            result.row_ptr_.get(), result.col_idx_.get(),
-            result.child_ptr_.get(), result.child_leaf_ids_.get());
-        detail::set_child_end_kernel<<<1, 1, 0, stream>>>(
-            result.child_ptr_.get(), parent_count, leaf.num_tiles);
-        detail::build_child_masks_kernel
-            <<<detail::build_blocks(parent_count), kBuildThreads, 0, stream>>>(
-                records.get(), parent_count, result.child_ptr_.get(),
-                result.child_mask_.get(), error.get());
-        detail::build_parent_boolean_rows_kernel
-            <<<detail::build_blocks(parent_count), kBuildThreads, 0, stream>>>(
-                leaf, role, parent_count, result.child_ptr_.get(),
-                result.child_mask_.get(), result.child_leaf_ids_.get(),
-                result.boolean_row_masks_.get());
-        if (!detail::cuda_ok(cudaGetLastError(),
-                             "launch Super16 parent materialization"))
-            return false;
-    }
-    else
-    {
-        if (!detail::cuda_ok(cudaMemsetAsync(result.child_ptr_.get(), 0,
-                                             sizeof(std::uint64_t), stream),
-                             "initialize empty Super16 child pointer"))
-            return false;
-    }
-
+    const unsigned int parent_row_blocks =
+        detail::build_blocks(static_cast<std::uint64_t>(parent_rows));
+    if (parent_row_blocks > 0)
+        detail::count_parent_columns_from_leaf_csr_kernel
+            <<<parent_row_blocks, kBuildThreads, 0, stream>>>(
+                leaf, row_group, col_group, parent_rows,
+                result.row_ptr_.get());
+    else if (!detail::cuda_ok(cudaMemsetAsync(result.row_ptr_.get(), 0,
+                                              sizeof(std::uint64_t), stream),
+                              "initialize empty Super16 parent rows"))
+        return false;
     try
     {
         auto policy = thrust::cuda::par.on(stream);
         thrust::device_ptr<std::uint64_t> ptr(result.row_ptr_.get());
-        thrust::inclusive_scan(policy, ptr, ptr + parent_rows + 1, ptr);
+        thrust::exclusive_scan(policy, ptr, ptr + parent_rows + 1, ptr);
     }
     catch (const std::exception &exception)
     {
@@ -3122,6 +3210,36 @@ inline bool build_device_index(const DmmaDeviceTiles &leaf, OperandRole role,
         cudaGetLastError();
         return false;
     }
+
+    std::uint64_t parent_count64 = 0;
+    if (!detail::copy_scalar_to_host(
+            stream, result.row_ptr_.get() + parent_rows, &parent_count64,
+            "read direct Super16 parent count") ||
+        parent_count64 > std::numeric_limits<std::uint32_t>::max())
+        return false;
+    const std::uint32_t parent_count =
+        static_cast<std::uint32_t>(parent_count64);
+    result.metadata_.parent_count = parent_count;
+    if (parent_row_blocks > 0)
+        detail::fill_parent_view_from_leaf_csr_kernel
+            <<<parent_row_blocks, kBuildThreads, 0, stream>>>(
+                leaf, row_group, col_group, parent_rows,
+                result.row_ptr_.get(), result.col_idx_.get(),
+                result.child_ptr_.get(), result.child_mask_.get(),
+                result.child_leaf_ids_.get());
+    else if (!detail::cuda_ok(cudaMemsetAsync(result.child_ptr_.get(), 0,
+                                              sizeof(std::uint64_t), stream),
+                              "initialize empty Super16 child pointer"))
+        return false;
+    if (parent_count > 0)
+        detail::build_parent_boolean_rows_kernel
+            <<<detail::build_blocks(parent_count), kBuildThreads, 0, stream>>>(
+                leaf, role, parent_count, result.child_ptr_.get(),
+                result.child_mask_.get(), result.child_leaf_ids_.get(),
+                result.boolean_row_masks_.get());
+    if (!detail::cuda_ok(cudaGetLastError(),
+                         "launch direct Super16 parent materialization"))
+        return false;
 
     if (role == OperandRole::B4x8)
     {
@@ -3627,6 +3745,7 @@ inline bool build_candidates_tile_spa(
         return false;
     output->reset();
     CandidateState result;
+    DeviceBuffer<std::uint64_t> raw_pair_count;
     if (!result.candidate_row_ptr.allocate(
             static_cast<std::uint64_t>(a.parent_row_count) + 1,
             "allocate Tile-style candidate row pointer") ||
@@ -3635,7 +3754,11 @@ inline bool build_candidates_tile_spa(
                              (static_cast<std::size_t>(a.parent_row_count) + 1) *
                                  sizeof(std::uint64_t),
                              stream),
-                         "clear Tile-style candidate row pointer"))
+                         "clear Tile-style candidate row pointer") ||
+        !raw_pair_count.allocate(1, "allocate Tile-style raw pair count") ||
+        !detail::cuda_ok(cudaMemsetAsync(raw_pair_count.get(), 0,
+                                         sizeof(unsigned long long), stream),
+                         "clear Tile-style raw pair count"))
         return false;
     detail::EventInterval symbolic_event;
     if (metrics != nullptr &&
@@ -3648,7 +3771,8 @@ inline bool build_candidates_tile_spa(
             kMaxBuildBlocks));
     if (blocks > 0)
         detail::tile_step1_spa_count_kernel<<<blocks, threads, 0, stream>>>(
-            a, b, result.candidate_row_ptr.get());
+            a, b, result.candidate_row_ptr.get(),
+            reinterpret_cast<unsigned long long *>(raw_pair_count.get()));
     if (!detail::cuda_ok(cudaGetLastError(),
                          "launch Tile-style SPA candidate count"))
         return false;
@@ -3666,9 +3790,12 @@ inline bool build_candidates_tile_spa(
         cudaGetLastError();
         return false;
     }
+    std::uint64_t raw_pairs = 0;
     if (!detail::copy_scalar_to_host(
             stream, result.candidate_row_ptr.get() + a.parent_row_count,
             &result.candidate_count, "read Tile-style candidate count") ||
+        !detail::copy_scalar_to_host(stream, raw_pair_count.get(), &raw_pairs,
+                                     "read Tile-style raw pair count") ||
         !result.keys.allocate(result.candidate_count,
                               "allocate Tile-style candidate keys"))
         return false;
@@ -3688,8 +3815,14 @@ inline bool build_candidates_tile_spa(
             return false;
         metrics->parent_a = a.parent_count;
         metrics->parent_b = b.parent_count;
+        metrics->raw_candidate_pairs = raw_pairs;
         metrics->parent_c_candidates = result.candidate_count;
         metrics->candidate.owner_count = a.parent_row_count;
+        metrics->candidate.total_structural_work = raw_pairs;
+        metrics->candidate.mean_owner_work =
+            a.parent_row_count == 0
+                ? 0.0
+                : static_cast<double>(raw_pairs) / a.parent_row_count;
         metrics->candidate_queue_ms = elapsed;
         metrics->candidate_keygen_ms = elapsed;
         metrics->scratch_bytes += result.keys.bytes() +
@@ -4434,7 +4567,8 @@ inline bool finalize_native_output(
     const DmmaDeviceTiles &a_leaf, const DmmaDeviceTiles &b_leaf,
     const DeviceIndexView &a, const DeviceIndexView &b,
     const CandidateState &candidates, const ExactState &exact,
-    cudaStream_t stream, bool collect_numeric_work, NativeOutput *output,
+    cudaStream_t stream, bool collect_numeric_work,
+    bool materialize_child_graph, NativeOutput *output,
     SymbolicMetrics *metrics = nullptr)
 {
     if (output == nullptr)
@@ -4460,13 +4594,19 @@ inline bool finalize_native_output(
     const auto begin_time = std::chrono::steady_clock::now();
     NativeOutput result;
     DeviceBuffer<int> error;
-    DeviceBuffer<std::uint64_t> child_local_offsets;
+    DeviceBuffer<unsigned long long> nonempty_parent_count;
     result.leaf_row_count = a_leaf.tile_row_count;
     result.leaf_col_count = b_leaf.tile_col_count;
     if (!error.allocate(1, "allocate Super16 finalize error") ||
+        !nonempty_parent_count.allocate(
+            1, "allocate Super16 parent audit counter") ||
+        !detail::cuda_ok(cudaMemsetAsync(
+                             nonempty_parent_count.get(), 0,
+                             sizeof(unsigned long long), stream),
+                         "clear Super16 parent audit counter") ||
         !detail::cuda_ok(cudaMemsetAsync(error.get(), 0, sizeof(int), stream),
                          "clear Super16 finalize error") ||
-        !child_local_offsets.allocate(
+        !result.child_local_offsets.allocate(
             candidates.candidate_count * 2,
             "allocate Super16 child local offsets") ||
         !result.row_ptr64.allocate(
@@ -4490,14 +4630,25 @@ inline bool finalize_native_output(
                 a.parent_row_count, b.parent_col_count,
                 result.leaf_row_count, result.leaf_col_count,
                 candidates.candidate_row_ptr.get(), candidates.keys.get(),
-                exact.parent_quadrant_masks.get(), child_local_offsets.get(),
-                result.row_ptr64.get(), error.get());
+                exact.parent_quadrant_masks.get(), result.child_local_offsets.get(),
+                result.row_ptr64.get(), nonempty_parent_count.get(),
+                error.get());
         if (!detail::cuda_ok(cudaGetLastError(),
                              "launch Super16 native row counting"))
             return false;
     }
     if (!detail::sync_and_read_error(stream, error.get(),
                                      "count Super16 native rows"))
+        return false;
+    unsigned long long nonempty_parents = 0;
+    if (!detail::cuda_ok(cudaMemcpyAsync(
+                             &nonempty_parents,
+                             nonempty_parent_count.get(),
+                             sizeof(nonempty_parents),
+                             cudaMemcpyDeviceToHost, stream),
+                         "read Super16 nonempty parent count") ||
+        !detail::cuda_ok(cudaStreamSynchronize(stream),
+                         "complete Super16 parent audit"))
         return false;
     try
     {
@@ -4526,17 +4677,26 @@ inline bool finalize_native_output(
         return false;
     }
     result.tile_count = static_cast<int>(tile_count);
-    if (!result.rows.allocate(tile_count,
-                              "allocate Super16 native output rows") ||
-        !result.cols.allocate(tile_count,
-                              "allocate Super16 native output columns") ||
-        !result.masks.allocate(tile_count,
-                               "allocate Super16 native output masks") ||
+    if ((materialize_child_graph &&
+         (!result.rows.allocate(tile_count,
+                                "allocate Super16 native output rows") ||
+          !result.cols.allocate(tile_count,
+                                "allocate Super16 native output columns") ||
+          !result.masks.allocate(tile_count,
+                                 "allocate Super16 native output masks"))) ||
         !result.nnz_offsets.allocate(
             tile_count + 1, "allocate Super16 native nnz offsets") ||
-        (collect_numeric_work &&
-         !result.numeric_work.allocate(
-             tile_count, "allocate Super16 native numeric work")) ||
+        (!materialize_child_graph &&
+         (!result.parent_task_ids.allocate(
+              candidates.candidate_count * 4,
+              "allocate Super16 parent child-task map") ||
+          !detail::cuda_ok(cudaMemsetAsync(
+                               result.parent_task_ids.get(), 0xff,
+                               static_cast<std::size_t>(
+                                   candidates.candidate_count * 4) *
+                                   sizeof(int),
+                               stream),
+                           "clear Super16 parent child-task map"))) ||
         !detail::cuda_ok(cudaMemsetAsync(
                              result.nnz_offsets.get(), 0,
                              (static_cast<std::size_t>(tile_count) + 1) *
@@ -4558,9 +4718,10 @@ inline bool finalize_native_output(
                0, stream>>>(
                 candidates.candidate_count, result.leaf_row_count,
                 result.leaf_col_count, candidates.keys.get(),
-                exact.parent_quadrant_masks.get(), child_local_offsets.get(),
+                exact.parent_quadrant_masks.get(), result.child_local_offsets.get(),
                 result.row_ptr64.get(), result.rows.get(), result.cols.get(),
-                result.masks.get(), result.nnz_offsets.get(), error.get());
+                result.masks.get(), result.nnz_offsets.get(),
+                result.parent_task_ids.get(), error.get());
     }
     if (!detail::cuda_ok(cudaGetLastError(),
                          "launch Super16 native output fill") ||
@@ -4568,17 +4729,9 @@ inline bool finalize_native_output(
                                      "fill Super16 native output"))
         return false;
 
-    if (collect_numeric_work && tile_count > 0)
-        detail::build_native_numeric_work_kernel
-            <<<detail::build_blocks(tile_count), kBuildThreads, 0, stream>>>(
-                a_leaf, b_leaf, result.tile_count, result.rows.get(),
-                result.cols.get(), result.masks.get(),
-                result.numeric_work.get(), error.get());
-    if (!detail::cuda_ok(cudaGetLastError(),
-                         "launch Super16 numeric-work build") ||
-        !detail::sync_and_read_error(stream, error.get(),
-                                     "build Super16 numeric-work metadata"))
-        return false;
+    /* Tail admission consumes the step2 parent work/matches and refines only
+     * potential heavy parents.  Never rebuild an output-sized numeric_work
+     * array here. */
 
     unsigned long long nnz_wide = 0;
     if (tile_count > 0)
@@ -4628,7 +4781,11 @@ inline bool finalize_native_output(
     if (metrics != nullptr)
     {
         metrics->final_leaf_c_tiles = tile_count;
-        metrics->scratch_bytes += child_local_offsets.bytes() +
+        metrics->nonempty_parent_c = nonempty_parents;
+        metrics->empty_parent_c =
+            candidates.candidate_count - nonempty_parents;
+        metrics->step2_parent_invocations = candidates.candidate_count;
+        metrics->scratch_bytes += result.child_local_offsets.bytes() +
                                   result.numeric_work.bytes();
         metrics->finalize_ms =
             std::chrono::duration<double, std::milli>(
@@ -4647,7 +4804,8 @@ inline bool run_parent_symbolic(const DmmaDeviceTiles &a_leaf,
                                 const DeviceIndexView &a,
                                 const DeviceIndexView &b,
                                 cudaStream_t stream, SymbolicOutput *output,
-                                bool collect_numeric_work = false)
+                                bool collect_numeric_work = false,
+                                bool materialize_child_graph = true)
 {
     const auto begin_time = std::chrono::steady_clock::now();
     if (output == nullptr)
@@ -4674,6 +4832,7 @@ inline bool run_parent_symbolic(const DmmaDeviceTiles &a_leaf,
     }
     if (!finalize_native_output(a_leaf, b_leaf, a, b, result.candidates,
                                 result.exact, stream, collect_numeric_work,
+                                materialize_child_graph,
                                 &result.native,
                                 &result.metrics))
         return false;

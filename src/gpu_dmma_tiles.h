@@ -71,6 +71,7 @@ struct DmmaBUpdateStats
     double csc_ms = 0.0;
     double mapping_ms = 0.0;
     double low_fill_metadata_ms = 0.0;
+    double super16_build_ms = 0.0;
     double value_update_ms = 0.0;
     double total_ms = 0.0;
     std::size_t peak_workspace_bytes = 0;
@@ -95,6 +96,7 @@ struct DmmaBWorkspace
 struct DmmaDynamicB
 {
     DmmaOwnedDeviceTiles tiles;
+    rtt::super16::OwnedDeviceIndex super16;
     int *source_to_payload = nullptr;
     int source_nnz = 0;
     int source_capacity = 0;
@@ -133,6 +135,7 @@ struct DmmaOfflineAStats
     double reorder_ms = 0.0;
     double key_sort_reduce_ms = 0.0;
     double tile_build_ms = 0.0;
+    double super16_build_ms = 0.0;
     double total_ms = 0.0;
     std::size_t peak_workspace_bytes = 0;
 };
@@ -142,6 +145,7 @@ struct DmmaPreparedA
     DmmaOwnedDeviceCsr csr;
     DmmaReorderPlan reorder;
     DmmaOwnedDeviceTiles tiles;
+    rtt::super16::OwnedDeviceIndex super16;
     int dense_threshold = 24;
     bool valid = false;
 };
@@ -611,7 +615,7 @@ static inline bool upload_csr(const SMatrix &host, cudaStream_t stream,
     }
 
     destroy_device_csr(out);
-    *out = result;
+    *out = std::move(result);
     return true;
 }
 
@@ -1040,7 +1044,7 @@ static inline bool build_tiles(const DmmaOwnedDeviceCsr &csr,
     }
 
     destroy_device_tiles(out);
-    *out = result;
+    *out = std::move(result);
     return true;
 }
 
@@ -1843,7 +1847,7 @@ static inline bool gpu_prepare_reordered_a(
     stats->total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - total_begin).count();
     destroy_prepared_a(out);
-    *out = result;
+    *out = std::move(result);
     return true;
 
 failure:
@@ -1897,7 +1901,7 @@ static inline bool gpu_prepare_external_a(
     stats->total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - total_begin).count();
     destroy_prepared_a(out);
-    *out = result;
+    *out = std::move(result);
     return true;
 
 failure:
@@ -1962,7 +1966,7 @@ static inline bool gpu_prepare_identity_a(
     stats->total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - total_begin).count();
     destroy_prepared_a(out);
-    *out = result;
+    *out = std::move(result);
     return true;
 }
 
