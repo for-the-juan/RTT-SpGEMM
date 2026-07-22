@@ -12,14 +12,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
-#include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -27,6 +27,7 @@ enum BUpdateMode
 {
     B_UPDATE_NONE,
     B_UPDATE_VALUES,
+    B_UPDATE_PERMUTATION,
     B_UPDATE_STRUCTURE
 };
 
@@ -62,34 +63,29 @@ struct Options
     int device = 0;
     int aat = 0;
     int dense_threshold = 24;
-    int warmup_iterations = 2;
-    int iterations = 10;
-    bool tileflex16_symbolic = false;
-    BUpdateMode b_update = B_UPDATE_VALUES;
+    int warmup_iterations = 0;
+    int iterations = 5;
+    bool tileflex16_symbolic = true;
+    BUpdateMode b_update = B_UPDATE_NONE;
     DmmaBValuesClearPolicy b_values_clear_policy =
         DMMA_B_VALUES_ALWAYS_CLEAR;
-    CusparseBenchmarkMode cusparse_benchmark = CUSPARSE_BENCHMARK_BOTH;
-    CoreTargetMode core_target = CORE_TARGET_BOTH;
+    CusparseBenchmarkMode cusparse_benchmark = CUSPARSE_BENCHMARK_OFF;
+    CoreTargetMode core_target = CORE_TARGET_OURS;
     CusparseWorkspacePolicy cusparse_workspace =
         CUSPARSE_WORKSPACE_PER_ITERATION;
-    OutputExportMode output_export = OUTPUT_EXPORT_EVERY;
-    DmmaNumericScheduleMode numeric_schedule = DMMA_SCHEDULE_DIRECT;
-    bool cost_balanced = false;
-    int cost_workers_per_sm = 4;
+    OutputExportMode output_export = OUTPUT_EXPORT_LAST;
+    DmmaNumericScheduleMode numeric_schedule =
+        DMMA_SCHEDULE_TILE_TAIL_QUEUE;
     DmmaDirectNumericLayout direct_numeric_layout =
         DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
-    int row_queue_batch = 1;
-    bool row_queue_batch_explicit = false;
-    int row_dynamic_auto = 0;
-    double row_dynamic_threshold = 1.10;
     DmmaPartialReductionMode partial_reduction = DMMA_REDUCTION_ATOMIC;
     DmmaLightPolicy light_policy = DMMA_LIGHT_STATIC;
     DmmaSplitLaunchPolicy split_launch_policy =
         DMMA_SPLIT_LAUNCH_HEAVY_PRIORITY;
     DmmaSymbolicAdmissionMode symbolic_admission =
-        DMMA_SYMBOLIC_ADMISSION_SEPARATE;
-    double split_threshold_ns = 256.0;
-    double split_chunk_target_ns = 0.0;
+        DMMA_SYMBOLIC_ADMISSION_FUSED_EXACT;
+    double split_threshold_ns = 16384.0;
+    double split_chunk_target_ns = 8192.0;
     int split_max_chunks = 8;
     int flat_warps_per_cta = 2;
     int split_workspace_mb = 1024;
@@ -126,70 +122,68 @@ struct Options
     const char *b_filename = nullptr;
     const char *dump_prefix = nullptr;
     const char *heatmap_prefix = nullptr;
-    const char *task_cost_model_filename = nullptr;
     const char *task_trace_filename = nullptr;
     const char *bgrf_variant = "full";
     int task_trace_sample_shift = 0;
     int task_trace_sample_phase = 0;
     int heatmap_bins = 256;
     bool prepare_only = false;
+    const char *lb_mode = "adaptive-tail";
 };
+
+static bool configure_lb_mode(const char *mode, Options *options)
+{
+    options->direct_numeric_layout = DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
+    options->partial_reduction = DMMA_REDUCTION_ATOMIC;
+    options->light_policy = DMMA_LIGHT_STATIC;
+    options->split_launch_policy = DMMA_SPLIT_LAUNCH_HEAVY_PRIORITY;
+    options->split_threshold_ns = 16384.0;
+    options->split_chunk_target_ns = 8192.0;
+    options->max_heavy_fraction = 0.01;
+    if (std::strcmp(mode, "static") == 0)
+    {
+        options->lb_mode = "static";
+        options->numeric_schedule = DMMA_SCHEDULE_DIRECT;
+        options->direct_numeric_layout = DMMA_DIRECT_NUMERIC_TILE_STATIC;
+        options->symbolic_admission = DMMA_SYMBOLIC_ADMISSION_SEPARATE;
+        return true;
+    }
+    if (std::strcmp(mode, "dynamic") == 0)
+    {
+        options->lb_mode = "dynamic";
+        options->numeric_schedule = DMMA_SCHEDULE_DIRECT;
+        options->symbolic_admission = DMMA_SYMBOLIC_ADMISSION_SEPARATE;
+        return true;
+    }
+    if (std::strcmp(mode, "adaptive-tail") == 0 ||
+        std::strcmp(mode, "tail") == 0)
+    {
+        options->lb_mode = "adaptive-tail";
+        options->numeric_schedule = DMMA_SCHEDULE_TILE_TAIL_QUEUE;
+        options->symbolic_admission = DMMA_SYMBOLIC_ADMISSION_FUSED_EXACT;
+        return true;
+    }
+    return false;
+}
+
 
 static void print_usage(const char *program)
 {
     std::printf(
-        "Usage: %s -d <gpu> -aat <0|1> [--b B.mtx] "
-        "[--dense-threshold <1..32>] [--warmup-iterations N] "
-        "[--iterations N] [--cusparse-benchmark off|original|same-order|both] "
-        "[--core-target both|ours|cusparse] "
-        "[--cusparse-workspace per-iteration|reusable] "
-        "[--output-export every|last] "
-        "[--symbolic-mode legacy|tileflex16] "
-        "[--numeric-schedule direct|cost-balanced|split-cta|split-persistent|split-flat|tile-tail-queue|tile-early-split] "
-        "[--cost-workers-per-sm 1..16] "
-        "[--direct-numeric-layout tile-dynamic|tile-static|row-static-block|row-dynamic] "
-        "[--row-queue-batch 1|2|4] "
-        "[--row-dynamic-auto 0|1 --row-dynamic-threshold FLOAT] "
-        "[--partial-reduction atomic|workspace] "
-        "[--light-policy static|persistent-suffix|persistent-unified] "
-        "[--critical-q-min FLOAT] [--suffix-workers-per-sm N] "
-        "[--suffix-auto-basis task|work|regular-work] "
-        "[--suffix-queue-batch N] [--suffix-fine-tail N] "
-        "[--unified-page-size N] [--unified-workers-per-sm N] "
-        "[--unified-fine-threshold-ns FLOAT] "
-        "[--unified-fine-capacity N] "
-        "[--split-launch-policy light-first|heavy-first|heavy-priority] "
-        "[--symbolic-admission separate|fused-exact] "
-        "[--task-cost-model FILE] [--split-threshold-ns FLOAT] "
-        "[--split-chunk-target-ns FLOAT] "
-        "[--flat-warps-per-cta 1|2|4] "
-        "[--task-trace FILE --task-trace-sample-shift N "
-        "--task-trace-sample-phase N] "
-        "[--split-max-chunks N] [--split-workspace-mb N] "
-        "[--tail-record-capacity N] [--tail-maybe-capacity N] "
-        "[--max-heavy-fraction FLOAT] "
-        "[--force-tail-split 0|1] "
-        "[--benchmark-sequence-index N] "
-        "[--collect-task-stats 0|1] "
-        "[--exact-forward-spa 0|1 "
-        "--exact-forward-min-row-pairs N "
-        "--exact-forward-min-ratio FLOAT] "
-        "[--low-fill-exact-tile 0|1 --low-fill-q 4|8|12|16] "
-        "[--collect-symbolic-load 0|1 --symbolic-load-quantum-ns FLOAT "
-        "--symbolic-wave-ctas-per-sm N --symbolic-critical-waves N] "
-        "[--bgrf-variant full|coarse|fine|coarse-row|coarse-inner|unguarded] "
-        "[--b-update none|values|structure] "
-        "[--b-values-clear always|noclear|safe-auto] [--no-reorder] "
-        "[--row-order FILE --inner-order FILE --reorder-name NAME] "
-        "[--dump-reorder-prefix P] [--dump-reorder-heatmap P] "
-        "[--heatmap-bins N] [--prepare-only] A.mtx\n"
-        "  tile-tail-queue requires --direct-numeric-layout tile-dynamic "
-        "--light-policy static --symbolic-admission fused-exact\n"
-        "  tile-early-split additionally requires --split-launch-policy "
-        "heavy-first; its equal-priority heavy queue is globally capped at "
-        "ceil(SM_count/2) CTAs\n"
-        "  low-fill-exact-tile requires direct + tile-dynamic + separate "
-        "symbolic admission and is incompatible with row/split/tail modes\n",
+        "Usage: %s [options] A.mtx\n"
+        "  -d GPU                         CUDA device (default: 0)\n"
+        "  --b B.mtx                     compute general A*B; otherwise A*A\n"
+        "  --lb-mode static|dynamic|adaptive-tail\n"
+        "                                 load-balancing mode (default: adaptive-tail)\n"
+        "  --warmup-iterations N         warmups (formal default: 0)\n"
+        "  --iterations N                repeats (formal default: 5)\n"
+        "  --b-update none|values|permutation|structure (default: none)\n"
+        "  --cusparse-benchmark off|original|same-order|both\n"
+        "  --core-target ours|cusparse|both (default: ours)\n"
+        "  --no-reorder                  identity-layout ablation\n"
+        "  --row-order FILE --inner-order FILE --reorder-name NAME\n"
+        "  --dump-reorder-prefix P | --dump-reorder-heatmap P\n"
+        "  --prepare-only\n",
         program);
 }
 
@@ -204,24 +198,15 @@ static bool parse_arguments(int argc, char **argv, Options *options)
             options->device = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "-aat") == 0 && i + 1 < argc)
             options->aat = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--dense-threshold") == 0 &&
-                 i + 1 < argc)
-            options->dense_threshold = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--iterations") == 0 &&
                  i + 1 < argc)
             options->iterations = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--warmup-iterations") == 0 &&
                  i + 1 < argc)
             options->warmup_iterations = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--symbolic-mode") == 0 &&
-                 i + 1 < argc)
+        else if (std::strcmp(argv[i], "--lb-mode") == 0 && i + 1 < argc)
         {
-            const char *mode = argv[++i];
-            if (std::strcmp(mode, "legacy") == 0)
-                options->tileflex16_symbolic = false;
-            else if (std::strcmp(mode, "tileflex16") == 0)
-                options->tileflex16_symbolic = true;
-            else
+            if (!configure_lb_mode(argv[++i], options))
                 return false;
         }
         else if (std::strcmp(argv[i], "--cusparse-benchmark") == 0 &&
@@ -252,270 +237,6 @@ static bool parse_arguments(int argc, char **argv, Options *options)
             else
                 return false;
         }
-        else if (std::strcmp(argv[i], "--cusparse-workspace") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *policy = argv[++i];
-            if (std::strcmp(policy, "per-iteration") == 0)
-                options->cusparse_workspace =
-                    CUSPARSE_WORKSPACE_PER_ITERATION;
-            else if (std::strcmp(policy, "reusable") == 0)
-                options->cusparse_workspace = CUSPARSE_WORKSPACE_REUSABLE;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--output-export") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *mode = argv[++i];
-            if (std::strcmp(mode, "every") == 0)
-                options->output_export = OUTPUT_EXPORT_EVERY;
-            else if (std::strcmp(mode, "last") == 0)
-                options->output_export = OUTPUT_EXPORT_LAST;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--numeric-schedule") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *mode = argv[++i];
-            if (std::strcmp(mode, "direct") == 0)
-            {
-                options->numeric_schedule = DMMA_SCHEDULE_DIRECT;
-                options->cost_balanced = false;
-            }
-            else if (std::strcmp(mode, "cost-balanced") == 0)
-            {
-                options->numeric_schedule = DMMA_SCHEDULE_DIRECT;
-                options->cost_balanced = true;
-            }
-            else if (std::strcmp(mode, "split-cta") == 0)
-                options->numeric_schedule = DMMA_SCHEDULE_SPLIT_CTA;
-            else if (std::strcmp(mode, "split-persistent") == 0)
-                options->numeric_schedule = DMMA_SCHEDULE_SPLIT_PERSISTENT;
-            else if (std::strcmp(mode, "split-flat") == 0)
-                options->numeric_schedule = DMMA_SCHEDULE_SPLIT_FLAT;
-            else if (std::strcmp(mode, "tile-tail-queue") == 0)
-                options->numeric_schedule =
-                    DMMA_SCHEDULE_TILE_TAIL_QUEUE;
-            else if (std::strcmp(mode, "tile-early-split") == 0)
-                options->numeric_schedule =
-                    DMMA_SCHEDULE_TILE_EARLY_SPLIT;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--direct-numeric-layout") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *layout = argv[++i];
-            if (std::strcmp(layout, "tile-dynamic") == 0)
-                options->direct_numeric_layout =
-                    DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
-            else if (std::strcmp(layout, "tile-static") == 0)
-                options->direct_numeric_layout =
-                    DMMA_DIRECT_NUMERIC_TILE_STATIC;
-            else if (std::strcmp(layout, "row-static-block") == 0)
-                options->direct_numeric_layout =
-                    DMMA_DIRECT_NUMERIC_ROW_STATIC;
-            else if (std::strcmp(layout, "row-dynamic") == 0)
-                options->direct_numeric_layout =
-                    DMMA_DIRECT_NUMERIC_ROW_DYNAMIC;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--cost-workers-per-sm") == 0 &&
-                 i + 1 < argc)
-            options->cost_workers_per_sm = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--row-queue-batch") == 0 &&
-                 i + 1 < argc)
-        {
-            options->row_queue_batch = std::atoi(argv[++i]);
-            options->row_queue_batch_explicit = true;
-        }
-        else if (std::strcmp(argv[i], "--row-dynamic-auto") == 0 &&
-                 i + 1 < argc)
-            options->row_dynamic_auto = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--row-dynamic-threshold") == 0 &&
-                 i + 1 < argc)
-            options->row_dynamic_threshold = std::strtod(argv[++i], nullptr);
-        else if (std::strcmp(argv[i], "--partial-reduction") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *mode = argv[++i];
-            if (std::strcmp(mode, "atomic") == 0)
-                options->partial_reduction = DMMA_REDUCTION_ATOMIC;
-            else if (std::strcmp(mode, "workspace") == 0)
-                options->partial_reduction = DMMA_REDUCTION_WORKSPACE;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--flat-warps-per-cta") == 0 &&
-                 i + 1 < argc)
-            options->flat_warps_per_cta = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--light-policy") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *policy = argv[++i];
-            if (std::strcmp(policy, "static") == 0)
-                options->light_policy = DMMA_LIGHT_STATIC;
-            else if (std::strcmp(policy, "persistent-suffix") == 0)
-                options->light_policy = DMMA_LIGHT_PERSISTENT_SUFFIX;
-            else if (std::strcmp(policy, "persistent-unified") == 0)
-                options->light_policy = DMMA_LIGHT_PERSISTENT_UNIFIED;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--critical-q-min") == 0 &&
-                 i + 1 < argc)
-            options->critical_q_min = std::strtod(argv[++i], nullptr);
-        else if (std::strcmp(argv[i], "--suffix-workers-per-sm") == 0 &&
-                 i + 1 < argc)
-            options->suffix_workers_per_sm = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--suffix-auto-basis") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *basis = argv[++i];
-            if (std::strcmp(basis, "task") == 0)
-                options->suffix_auto_basis = DMMA_SUFFIX_AUTO_TASK;
-            else if (std::strcmp(basis, "work") == 0)
-                options->suffix_auto_basis = DMMA_SUFFIX_AUTO_WORK;
-            else if (std::strcmp(basis, "regular-work") == 0)
-                options->suffix_auto_basis =
-                    DMMA_SUFFIX_AUTO_REGULAR_WORK;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--suffix-queue-batch") == 0 &&
-                 i + 1 < argc)
-            options->suffix_queue_batch = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--suffix-fine-tail") == 0 &&
-                 i + 1 < argc)
-            options->suffix_fine_tail = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--unified-page-size") == 0 &&
-                 i + 1 < argc)
-            options->unified_page_size = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--unified-workers-per-sm") == 0 &&
-                 i + 1 < argc)
-            options->unified_workers_per_sm = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--unified-fine-threshold-ns") == 0 &&
-                 i + 1 < argc)
-            options->unified_fine_threshold_ns =
-                std::strtod(argv[++i], nullptr);
-        else if (std::strcmp(argv[i], "--unified-fine-capacity") == 0 &&
-                 i + 1 < argc)
-            options->unified_fine_capacity = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--split-launch-policy") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *policy = argv[++i];
-            if (std::strcmp(policy, "light-first") == 0)
-                options->split_launch_policy =
-                    DMMA_SPLIT_LAUNCH_LIGHT_FIRST;
-            else if (std::strcmp(policy, "heavy-first") == 0)
-                options->split_launch_policy =
-                    DMMA_SPLIT_LAUNCH_HEAVY_FIRST;
-            else if (std::strcmp(policy, "heavy-priority") == 0)
-                options->split_launch_policy =
-                    DMMA_SPLIT_LAUNCH_HEAVY_PRIORITY;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--task-cost-model") == 0 &&
-                 i + 1 < argc)
-            options->task_cost_model_filename = argv[++i];
-        else if (std::strcmp(argv[i], "--symbolic-admission") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *mode = argv[++i];
-            if (std::strcmp(mode, "separate") == 0)
-                options->symbolic_admission =
-                    DMMA_SYMBOLIC_ADMISSION_SEPARATE;
-            else if (std::strcmp(mode, "fused-exact") == 0)
-                options->symbolic_admission =
-                    DMMA_SYMBOLIC_ADMISSION_FUSED_EXACT;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--task-trace") == 0 &&
-                 i + 1 < argc)
-            options->task_trace_filename = argv[++i];
-        else if (std::strcmp(argv[i], "--task-trace-sample-shift") == 0 &&
-                 i + 1 < argc)
-            options->task_trace_sample_shift = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--task-trace-sample-phase") == 0 &&
-                 i + 1 < argc)
-            options->task_trace_sample_phase = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--split-threshold-ns") == 0 &&
-                 i + 1 < argc)
-            options->split_threshold_ns = std::strtod(argv[++i], nullptr);
-        else if (std::strcmp(argv[i], "--split-chunk-target-ns") == 0 &&
-                 i + 1 < argc)
-            options->split_chunk_target_ns = std::strtod(argv[++i], nullptr);
-        else if (std::strcmp(argv[i], "--split-max-chunks") == 0 &&
-                 i + 1 < argc)
-            options->split_max_chunks = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--split-workspace-mb") == 0 &&
-                 i + 1 < argc)
-            options->split_workspace_mb = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--tail-record-capacity") == 0 &&
-                 i + 1 < argc)
-            options->tail_record_capacity = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--tail-maybe-capacity") == 0 &&
-                 i + 1 < argc)
-            options->tail_maybe_capacity = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--max-heavy-fraction") == 0 &&
-                 i + 1 < argc)
-            options->max_heavy_fraction = std::strtod(argv[++i], nullptr);
-        else if (std::strcmp(argv[i], "--force-tail-split") == 0 &&
-                 i + 1 < argc)
-            options->force_tail_split = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--benchmark-sequence-index") == 0 &&
-                 i + 1 < argc)
-            options->benchmark_sequence_index = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--collect-task-stats") == 0 &&
-                 i + 1 < argc)
-            options->collect_task_stats = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--exact-forward-spa") == 0 &&
-                 i + 1 < argc)
-            options->exact_forward_spa = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i],
-                             "--exact-forward-min-row-pairs") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *text = argv[++i];
-            char *end = nullptr;
-            errno = 0;
-            const unsigned long long value = std::strtoull(text, &end, 10);
-            if (errno != 0 || end == text || *end != '\0')
-                return false;
-            options->exact_forward_min_row_pairs = value;
-        }
-        else if (std::strcmp(argv[i], "--exact-forward-min-ratio") == 0 &&
-                 i + 1 < argc)
-            options->exact_forward_min_ratio =
-                std::strtod(argv[++i], nullptr);
-        else if (std::strcmp(argv[i], "--low-fill-exact-tile") == 0 &&
-                 i + 1 < argc)
-            options->low_fill_exact_tile = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--low-fill-q") == 0 &&
-                 i + 1 < argc)
-            options->low_fill_q = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--collect-symbolic-load") == 0 &&
-                 i + 1 < argc)
-            options->collect_symbolic_load = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--symbolic-load-quantum-ns") == 0 &&
-                 i + 1 < argc)
-            options->symbolic_load_quantum_ns =
-                std::strtod(argv[++i], nullptr);
-        else if (std::strcmp(argv[i], "--symbolic-wave-ctas-per-sm") == 0 &&
-                 i + 1 < argc)
-            options->symbolic_wave_ctas_per_sm = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--symbolic-critical-waves") == 0 &&
-                 i + 1 < argc)
-            options->symbolic_critical_waves = std::atoi(argv[++i]);
-        else if (std::strcmp(argv[i], "--bgrf-variant") == 0 &&
-                 i + 1 < argc)
-            options->bgrf_variant = argv[++i];
         else if (std::strcmp(argv[i], "--b") == 0 && i + 1 < argc)
             options->b_filename = argv[++i];
         else if (std::strcmp(argv[i], "--b-update") == 0 &&
@@ -526,23 +247,10 @@ static bool parse_arguments(int argc, char **argv, Options *options)
                 options->b_update = B_UPDATE_NONE;
             else if (std::strcmp(mode, "values") == 0)
                 options->b_update = B_UPDATE_VALUES;
+            else if (std::strcmp(mode, "permutation") == 0)
+                options->b_update = B_UPDATE_PERMUTATION;
             else if (std::strcmp(mode, "structure") == 0)
                 options->b_update = B_UPDATE_STRUCTURE;
-            else
-                return false;
-        }
-        else if (std::strcmp(argv[i], "--b-values-clear") == 0 &&
-                 i + 1 < argc)
-        {
-            const char *policy = argv[++i];
-            if (std::strcmp(policy, "always") == 0 ||
-                std::strcmp(policy, "always-clear") == 0)
-                options->b_values_clear_policy =
-                    DMMA_B_VALUES_ALWAYS_CLEAR;
-            else if (std::strcmp(policy, "noclear") == 0)
-                options->b_values_clear_policy = DMMA_B_VALUES_NOCLEAR;
-            else if (std::strcmp(policy, "safe-auto") == 0)
-                options->b_values_clear_policy = DMMA_B_VALUES_SAFE_AUTO;
             else
                 return false;
         }
@@ -580,13 +288,6 @@ static bool parse_arguments(int argc, char **argv, Options *options)
                                    options->inner_order_filename != nullptr &&
                                    options->reorder_name != nullptr;
     bool valid_reorder_name = true;
-    const bool valid_bgrf_variant =
-        std::strcmp(options->bgrf_variant, "full") == 0 ||
-        std::strcmp(options->bgrf_variant, "coarse") == 0 ||
-        std::strcmp(options->bgrf_variant, "fine") == 0 ||
-        std::strcmp(options->bgrf_variant, "coarse-row") == 0 ||
-        std::strcmp(options->bgrf_variant, "coarse-inner") == 0 ||
-        std::strcmp(options->bgrf_variant, "unguarded") == 0;
     if (options->reorder_name != nullptr)
     {
         const std::size_t length = std::strlen(options->reorder_name);
@@ -604,126 +305,8 @@ static bool parse_arguments(int argc, char **argv, Options *options)
     }
     return options->a_filename != nullptr &&
            (options->aat == 0 || options->aat == 1) &&
-           options->dense_threshold >= 1 &&
-           options->dense_threshold <= DMMA_INPUT_ELEMS &&
            options->warmup_iterations >= 0 && options->iterations > 0 &&
-           options->cost_workers_per_sm >= 1 &&
-           options->cost_workers_per_sm <= 16 &&
-           std::isfinite(options->split_threshold_ns) &&
-           options->split_threshold_ns > 0.0 &&
-           std::isfinite(options->split_chunk_target_ns) &&
-           options->split_chunk_target_ns >= 0.0 &&
-           options->split_max_chunks >= 2 &&
-           options->split_max_chunks <= 32 &&
-           (options->flat_warps_per_cta == 1 ||
-            options->flat_warps_per_cta == 2 ||
-            options->flat_warps_per_cta == 4) &&
-           dmma_row_queue_batch_valid(options->row_queue_batch) &&
-           (!options->row_queue_batch_explicit ||
-            options->row_dynamic_auto == 1 ||
-            options->direct_numeric_layout ==
-                DMMA_DIRECT_NUMERIC_ROW_DYNAMIC) &&
-           (options->row_dynamic_auto == 0 ||
-            options->row_dynamic_auto == 1) &&
-           std::isfinite(options->row_dynamic_threshold) &&
-           options->row_dynamic_threshold >= 1.0 &&
-           (options->row_dynamic_auto == 0 ||
-            options->numeric_schedule == DMMA_SCHEDULE_DIRECT) &&
-           options->split_workspace_mb >= 0 &&
-           std::isfinite(options->critical_q_min) &&
-           options->critical_q_min >= 0.0 &&
-           options->critical_q_min <= 1.0 &&
-           options->suffix_workers_per_sm >= 0 &&
-           options->suffix_workers_per_sm <= 32 &&
-           (options->suffix_auto_basis == DMMA_SUFFIX_AUTO_TASK ||
-            options->suffix_auto_basis == DMMA_SUFFIX_AUTO_WORK ||
-            options->suffix_auto_basis ==
-                DMMA_SUFFIX_AUTO_REGULAR_WORK) &&
-           options->suffix_queue_batch >= 1 &&
-           options->suffix_queue_batch <= 1024 &&
-           options->suffix_fine_tail >= 0 &&
-           options->suffix_fine_tail <= 1024 &&
-           options->unified_page_size >= 1 &&
-           options->unified_page_size <= 4096 &&
-           options->unified_workers_per_sm >= 0 &&
-           options->unified_workers_per_sm <= 32 &&
-           std::isfinite(options->unified_fine_threshold_ns) &&
-           options->unified_fine_threshold_ns >= 0.0 &&
-           options->unified_fine_capacity >= 1 &&
-           options->tail_record_capacity > 0 &&
-           options->tail_maybe_capacity > 0 &&
-           std::isfinite(options->max_heavy_fraction) &&
-           options->max_heavy_fraction >= 0.0 &&
-           options->max_heavy_fraction <= 1.0 &&
-           (options->force_tail_split == 0 ||
-            options->force_tail_split == 1) &&
-           options->benchmark_sequence_index >= 0 &&
-           (options->collect_task_stats == 0 ||
-            options->collect_task_stats == 1) &&
-           (options->exact_forward_spa == 0 ||
-            options->exact_forward_spa == 1) &&
-           options->exact_forward_min_row_pairs > 0 &&
-           std::isfinite(options->exact_forward_min_ratio) &&
-           options->exact_forward_min_ratio >= 1.0 &&
-           (options->low_fill_exact_tile == 0 ||
-            options->low_fill_exact_tile == 1) &&
-           ((options->low_fill_exact_tile == 0 &&
-             options->low_fill_q == 0) ||
-            (options->low_fill_exact_tile == 1 &&
-             dmma_low_fill_q_valid(options->low_fill_q) &&
-             options->numeric_schedule == DMMA_SCHEDULE_DIRECT &&
-             options->direct_numeric_layout ==
-                 DMMA_DIRECT_NUMERIC_TILE_DYNAMIC &&
-             options->row_dynamic_auto == 0 &&
-             options->exact_forward_spa == 0 &&
-             options->symbolic_admission ==
-                 DMMA_SYMBOLIC_ADMISSION_SEPARATE &&
-             options->collect_symbolic_load == 0)) &&
-           (options->exact_forward_spa == 0 ||
-            (options->numeric_schedule == DMMA_SCHEDULE_DIRECT &&
-             options->row_dynamic_auto == 0 &&
-             options->direct_numeric_layout ==
-                 DMMA_DIRECT_NUMERIC_TILE_DYNAMIC &&
-             options->symbolic_admission ==
-                 DMMA_SYMBOLIC_ADMISSION_SEPARATE &&
-             options->collect_symbolic_load == 0)) &&
-           (options->collect_symbolic_load == 0 ||
-            options->collect_symbolic_load == 1) &&
-           std::isfinite(options->symbolic_load_quantum_ns) &&
-           options->symbolic_load_quantum_ns > 0.0 &&
-           options->symbolic_wave_ctas_per_sm >= 1 &&
-           options->symbolic_wave_ctas_per_sm <= 32 &&
-           options->symbolic_critical_waves >= 1 &&
-           options->symbolic_critical_waves <= 64 &&
-           (options->direct_numeric_layout ==
-                DMMA_DIRECT_NUMERIC_TILE_DYNAMIC ||
-            options->numeric_schedule == DMMA_SCHEDULE_DIRECT) &&
-           (options->symbolic_admission ==
-                DMMA_SYMBOLIC_ADMISSION_SEPARATE ||
-            options->numeric_schedule != DMMA_SCHEDULE_DIRECT) &&
-           (options->numeric_schedule != DMMA_SCHEDULE_TILE_TAIL_QUEUE ||
-            (options->direct_numeric_layout ==
-                 DMMA_DIRECT_NUMERIC_TILE_DYNAMIC &&
-             options->light_policy == DMMA_LIGHT_STATIC &&
-             options->symbolic_admission ==
-                 DMMA_SYMBOLIC_ADMISSION_FUSED_EXACT)) &&
-           (options->numeric_schedule != DMMA_SCHEDULE_TILE_EARLY_SPLIT ||
-            (options->direct_numeric_layout ==
-                 DMMA_DIRECT_NUMERIC_TILE_DYNAMIC &&
-             options->light_policy == DMMA_LIGHT_STATIC &&
-             options->symbolic_admission ==
-                 DMMA_SYMBOLIC_ADMISSION_FUSED_EXACT &&
-             options->split_launch_policy ==
-                 DMMA_SPLIT_LAUNCH_HEAVY_FIRST)) &&
-           options->task_trace_sample_shift >= 0 &&
-           options->task_trace_sample_shift <= 30 &&
-           options->task_trace_sample_phase >= 0 &&
-           static_cast<unsigned int>(options->task_trace_sample_phase) <
-               (1u << options->task_trace_sample_shift) &&
-           (options->task_trace_filename == nullptr ||
-            options->numeric_schedule == DMMA_SCHEDULE_DIRECT) &&
-           valid_bgrf_variant && options->heatmap_bins >= 16 &&
-           options->heatmap_bins <= 1024 &&
+           options->heatmap_bins >= 16 && options->heatmap_bins <= 1024 &&
            (!any_external || complete_external) &&
            !(options->no_reorder && any_external) && valid_reorder_name &&
            (options->core_target != CORE_TARGET_CUSPARSE ||
@@ -852,92 +435,6 @@ static void print_samples(const std::vector<double> &samples)
     for (std::size_t index = 0; index < samples.size(); ++index)
         std::printf("%s%.6f", index == 0 ? "" : ",", samples[index]);
     std::printf("]");
-}
-
-static bool parse_finite_nonnegative(const std::string &text,
-                                     double *value)
-{
-    if (value == nullptr || text.empty())
-        return false;
-    errno = 0;
-    char *end = nullptr;
-    const double parsed = std::strtod(text.c_str(), &end);
-    if (errno != 0 || end == text.c_str() || *end != '\0' ||
-        !std::isfinite(parsed) || parsed < 0.0)
-        return false;
-    *value = parsed;
-    return true;
-}
-
-static bool load_task_cost_model(const char *filename,
-                                 DmmaTaskCostModel *model)
-{
-    if (model == nullptr)
-        return false;
-    if (filename == nullptr)
-        return true;
-    std::ifstream input(filename);
-    if (!input)
-    {
-        std::fprintf(stderr, "Unable to open task cost model: %s\n",
-                     filename);
-        return false;
-    }
-    bool have_intercept = false;
-    bool have_scan = false;
-    bool have_match = false;
-    bool have_output = false;
-    bool valid_feature_order = false;
-    std::string line;
-    while (std::getline(input, line))
-    {
-        if (line.empty() || line[0] == '#')
-            continue;
-        const std::size_t separator = line.find('=');
-        if (separator == std::string::npos)
-            continue;
-        const std::string key = line.substr(0, separator);
-        const std::string value = line.substr(separator + 1);
-        double coefficient = 0.0;
-        if (key == "feature_order")
-        {
-            valid_feature_order = value == "scan_steps,matches,output_nnz";
-        }
-        else if (key == "beta0_ns")
-        {
-            have_intercept = parse_finite_nonnegative(value, &coefficient);
-            if (have_intercept)
-                model->intercept = coefficient;
-        }
-        else if (key == "beta_scan_ns_per_step")
-        {
-            have_scan = parse_finite_nonnegative(value, &coefficient);
-            if (have_scan)
-                model->scan = coefficient;
-        }
-        else if (key == "beta_match_ns_per_match")
-        {
-            have_match = parse_finite_nonnegative(value, &coefficient);
-            if (have_match)
-                model->match = coefficient;
-        }
-        else if (key == "beta_output_ns_per_nnz")
-        {
-            have_output = parse_finite_nonnegative(value, &coefficient);
-            if (have_output)
-                model->output = coefficient;
-        }
-    }
-    if (!valid_feature_order || !have_intercept || !have_scan ||
-        !have_match || !have_output)
-    {
-        std::fprintf(stderr,
-                     "Invalid task cost model %s: expected analyzer's four "
-                     "non-negative coefficients and feature_order.\n",
-                     filename);
-        return false;
-    }
-    return true;
 }
 
 struct HostCsrBuffer
@@ -1865,7 +1362,9 @@ static const char *b_update_mode_name(BUpdateMode mode)
 {
     if (mode == B_UPDATE_NONE)
         return "none";
-    return mode == B_UPDATE_VALUES ? "values" : "structure";
+    if (mode == B_UPDATE_VALUES)
+        return "values";
+    return mode == B_UPDATE_PERMUTATION ? "permutation" : "structure";
 }
 
 static void print_b_values_clear_marker(
@@ -1909,9 +1408,11 @@ static void print_b_values_clear_marker(
 
 static bool rebuild_b(const Options &options, const DmmaPreparedA &a,
                       const DmmaOwnedDeviceCsr &independent_b,
-                      DmmaDynamicB *b, DmmaBUpdateStats *stats)
+                      DmmaDynamicB *b, DmmaBUpdateStats *stats,
+                      bool apply_permutation = true)
 {
-    const int *inner_old_to_new = a.reorder.d_inner_old_to_new;
+    const int *inner_old_to_new = apply_permutation
+        ? a.reorder.d_inner_old_to_new : nullptr;
     const int active_inner = a.reorder.active_inner;
     bool rebuilt = false;
     if (options.b_filename != nullptr)
@@ -1963,17 +1464,14 @@ int main(int argc, char **argv)
 
     DmmaNumericScheduleConfig schedule_config;
     schedule_config.tileflex16_symbolic = options.tileflex16_symbolic;
-    schedule_config.cost_balanced = options.cost_balanced;
-    schedule_config.cost_workers_per_sm = options.cost_workers_per_sm;
+    schedule_config.cost_balanced = false;
+    schedule_config.cost_workers_per_sm = 4;
     DmmaReorderConfig reorder_config;
     if (!parse_dmma_reorder_variant(options.bgrf_variant,
                                     &reorder_config.variant))
         return EXIT_FAILURE;
     schedule_config.mode = options.numeric_schedule;
     schedule_config.direct_numeric_layout = options.direct_numeric_layout;
-    schedule_config.row_queue_batch = options.row_queue_batch;
-    schedule_config.row_dynamic_auto = options.row_dynamic_auto != 0;
-    schedule_config.row_dynamic_threshold = options.row_dynamic_threshold;
     schedule_config.reduction = options.partial_reduction;
     schedule_config.light_policy = options.light_policy;
     schedule_config.launch_policy = options.split_launch_policy;
@@ -2025,9 +1523,6 @@ int main(int argc, char **argv)
     const char *matrix_label = std::strrchr(options.a_filename, '/');
     schedule_config.matrix_name =
         matrix_label == nullptr ? options.a_filename : matrix_label + 1;
-    if (!load_task_cost_model(options.task_cost_model_filename,
-                              &schedule_config.cost))
-        return EXIT_FAILURE;
 
     if (!dmma_cuda_ok(cudaSetDevice(options.device), "select GPU"))
         return EXIT_FAILURE;
@@ -2081,6 +1576,23 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    const char *verbose_value = std::getenv("RTT_VERBOSE_LOG");
+    const bool verbose_log =
+        verbose_value != nullptr && std::strcmp(verbose_value, "1") == 0;
+    int saved_stdout_fd = -1;
+    bool stdout_suppressed = false;
+    if (!verbose_log)
+    {
+        std::fflush(stdout);
+        saved_stdout_fd = dup(STDOUT_FILENO);
+        const int null_fd = open("/dev/null", O_WRONLY);
+        if (saved_stdout_fd >= 0 && null_fd >= 0 &&
+            dup2(null_fd, STDOUT_FILENO) >= 0)
+            stdout_suppressed = true;
+        if (null_fd >= 0)
+            close(null_fd);
+    }
+
     std::printf("---------------------------------------------------------------\n");
     std::printf("Device [ %d ] %s @ %.2f MHz, compute capability %d.%d\n",
                 options.device, properties.name,
@@ -2118,9 +1630,6 @@ int main(int argc, char **argv)
         "unsafe_action=clear-fallback timing_boundary=unchanged\n",
         dmma_b_values_clear_policy_name(options.b_values_clear_policy));
     std::printf("NUMERIC_SCHEDULE mode=%s direct_layout=%s "
-                "row_queue_batch=%d "
-                "row_dynamic_auto=%d row_dynamic_threshold=%.9f "
-                "row_gate_version=exact-row-ptr-v1 "
                 "reduction=%s launch_policy=%s "
                 "light_policy=%s critical_q_min=%.9f "
                 "suffix_workers_per_sm=%d suffix_auto_basis=%s "
@@ -2145,9 +1654,6 @@ int main(int argc, char **argv)
                                         schedule_config.cost_balanced),
                 dmma_direct_numeric_layout_name(
                     schedule_config.direct_numeric_layout),
-                schedule_config.row_queue_batch,
-                schedule_config.row_dynamic_auto ? 1 : 0,
-                schedule_config.row_dynamic_threshold,
                 reduction_name(schedule_config.reduction),
                 launch_policy_name(schedule_config.launch_policy),
                 dmma_light_policy_name(schedule_config.light_policy),
@@ -2176,9 +1682,7 @@ int main(int argc, char **argv)
                 schedule_config.maybe_candidate_capacity,
                 schedule_config.max_heavy_fraction,
                 schedule_config.force_tail_split ? 1 : 0,
-                options.task_cost_model_filename == nullptr
-                    ? "builtin"
-                    : options.task_cost_model_filename,
+                "builtin",
                 schedule_config.collect_symbolic_load ? 1 : 0,
                 schedule_config.mode != DMMA_SCHEDULE_DIRECT &&
                         schedule_config.light_policy ==
@@ -2276,9 +1780,10 @@ int main(int argc, char **argv)
         "effective_cusparse=%s cusparse_workspace=%s "
         "ours_core=%d cusparse_core=%d "
         "process_backend_count=%d cuda_context_shared_between_methods=%d "
-        "setup_core_excluded=1 compiled_check_result=%d "
+        "setup_core_excluded=1 capacity_workspace_reuse=0 structure_cache=0 tail_record_cache=0 compiled_check_result=%d "
         "legacy_validation=%d correctness_validation=out-of-band "
-        "warmup=%d iterations=%d selection=min\n",
+        "warmup=%d iterations=%d selection=median "
+        "repeat_scope=same-process formal_repeat_count=5\n",
         core_target_name(options.core_target),
         options.core_target == CORE_TARGET_CUSPARSE
             ? "cusparse"
@@ -2337,19 +1842,16 @@ int main(int argc, char **argv)
     std::vector<double> dmma_times;
     std::vector<double> combined_times;
     std::vector<double> single_shot_all_cost_times;
+    std::vector<double> symbolic_stage_times;
+    std::vector<double> allocation_stage_times;
+    std::vector<double> numeric_stage_times;
+    std::vector<double> flex_style_total_times;
     std::vector<double> export_times;
     std::vector<double> restore_times;
     DmmaPartialReductionMode summary_effective_reduction =
         schedule_config.reduction;
     bool summary_workspace_fallback = false;
     bool summary_context_reused = false;
-    bool summary_row_static_mapping_valid = true;
-    int summary_row_static_ctas = 0;
-    int summary_row_static_min_unique_sms = 0;
-    bool summary_row_dynamic_mapping_valid = true;
-    bool summary_row_dynamic_claims_valid = true;
-    int summary_row_dynamic_ctas = 0;
-    int summary_row_dynamic_min_unique_sms = 0;
     DmmaDirectNumericLayout summary_direct_numeric_layout =
         schedule_config.direct_numeric_layout;
     bool summary_direct_numeric_layout_initialized = false;
@@ -2494,7 +1996,8 @@ int main(int argc, char **argv)
     {
         DmmaBUpdateStats initial_b_stats;
         if (!rebuild_b(options, prepared_a, device_b, &dynamic_b,
-                       &initial_b_stats))
+                       &initial_b_stats,
+                       options.b_update != B_UPDATE_PERMUTATION))
         {
             std::fprintf(stderr, "Initial GPU B rebuild failed.\n");
             goto cleanup;
@@ -2600,6 +2103,10 @@ int main(int argc, char **argv)
     dmma_times.reserve(options.iterations);
     combined_times.reserve(options.iterations);
     single_shot_all_cost_times.reserve(options.iterations);
+    symbolic_stage_times.reserve(options.iterations);
+    allocation_stage_times.reserve(options.iterations);
+    numeric_stage_times.reserve(options.iterations);
+    flex_style_total_times.reserve(options.iterations);
     export_times.reserve(options.iterations);
     restore_times.reserve(options.iterations);
 
@@ -2628,7 +2135,8 @@ int main(int argc, char **argv)
         {
             update_ok = true;
         }
-        else if (options.b_update == B_UPDATE_STRUCTURE)
+        else if (options.b_update == B_UPDATE_STRUCTURE ||
+                 options.b_update == B_UPDATE_PERMUTATION)
         {
             update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
                                   &update_stats);
@@ -2670,19 +2178,7 @@ int main(int argc, char **argv)
                     "phase=warmup warmup=1 iteration=%d core_ms=%.6f "
                     "b_update_ms=%.6f b_update_wall_ms=%.6f "
                     "b_update_mode=%s dmma_ms=%.6f "
-                    "schedule=%s direct_layout=%s "
-                    "row_static_used=%d row_static_ctas=%d "
-                    "row_static_unique_sms=%d row_static_mapping_valid=%d "
-                    "row_dynamic_used=%d row_dynamic_ctas=%d "
-                    "row_dynamic_unique_sms=%d "
-                    "row_dynamic_mapping_valid=%d "
-                    "row_dynamic_queue_batch=%d "
-                    "row_dynamic_atomic_claims=%d "
-                    "row_dynamic_final_head=%d "
-                    "row_dynamic_expected_atomic_claims=%d "
-                    "row_dynamic_expected_final_head=%d "
-                    "row_dynamic_claims=%d row_dynamic_claims_valid=%d "
-                    "launch_policy=%s light_policy=%s "
+                    "schedule=%s direct_layout=%s "                    "launch_policy=%s light_policy=%s "
                     "context_reused=%d context_create_ms_untimed=%.6f "
                     "output_state=native-output-ready output_format=tile "
                     "output_export=skipped clock=continuous-wall "
@@ -2699,21 +2195,6 @@ int main(int argc, char **argv)
                         warmup_stats.cost_balanced_requested),
                     dmma_direct_numeric_layout_name(
                         warmup_stats.direct_numeric_layout),
-                    warmup_stats.row_static_used ? 1 : 0,
-                    warmup_stats.row_static_ctas,
-                    warmup_stats.row_static_unique_sms,
-                    warmup_stats.row_static_mapping_valid ? 1 : 0,
-                    warmup_stats.row_dynamic_used ? 1 : 0,
-                    warmup_stats.row_dynamic_ctas,
-                    warmup_stats.row_dynamic_unique_sms,
-                    warmup_stats.row_dynamic_mapping_valid ? 1 : 0,
-                    warmup_stats.row_dynamic_queue_batch,
-                    warmup_stats.row_dynamic_claims,
-                    warmup_stats.row_dynamic_final_head,
-                    warmup_stats.row_dynamic_expected_claims,
-                    warmup_stats.row_dynamic_expected_final_head,
-                    warmup_stats.row_dynamic_claims,
-                    warmup_stats.row_dynamic_claims_valid ? 1 : 0,
                     launch_policy_name(warmup_stats.launch_policy),
                     dmma_light_policy_name(warmup_stats.light_policy),
                     warmup_stats.split_context_reused ? 1 : 0,
@@ -2754,7 +2235,8 @@ int main(int argc, char **argv)
         {
             update_ok = true;
         }
-        else if (options.b_update == B_UPDATE_STRUCTURE)
+        else if (options.b_update == B_UPDATE_STRUCTURE ||
+                 options.b_update == B_UPDATE_PERMUTATION)
         {
             update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
                                   &update_stats);
@@ -2883,41 +2365,21 @@ int main(int argc, char **argv)
                          "Numeric layout changed across timed iterations.\n");
             goto cleanup;
         }
-        if (dmma_stats.row_static_used)
-        {
-            summary_row_static_mapping_valid =
-                summary_row_static_mapping_valid &&
-                dmma_stats.row_static_mapping_valid;
-            summary_row_static_ctas = dmma_stats.row_static_ctas;
-            if (summary_row_static_min_unique_sms == 0)
-                summary_row_static_min_unique_sms =
-                    dmma_stats.row_static_unique_sms;
-            else
-                summary_row_static_min_unique_sms = std::min(
-                    summary_row_static_min_unique_sms,
-                    dmma_stats.row_static_unique_sms);
-        }
-        if (dmma_stats.row_dynamic_used)
-        {
-            summary_row_dynamic_mapping_valid =
-                summary_row_dynamic_mapping_valid &&
-                dmma_stats.row_dynamic_mapping_valid;
-            summary_row_dynamic_claims_valid =
-                summary_row_dynamic_claims_valid &&
-                dmma_stats.row_dynamic_claims_valid;
-            summary_row_dynamic_ctas = dmma_stats.row_dynamic_ctas;
-            if (summary_row_dynamic_min_unique_sms == 0)
-                summary_row_dynamic_min_unique_sms =
-                    dmma_stats.row_dynamic_unique_sms;
-            else
-                summary_row_dynamic_min_unique_sms = std::min(
-                    summary_row_dynamic_min_unique_sms,
-                    dmma_stats.row_dynamic_unique_sms);
-        }
         b_update_times.push_back(update_stats.total_ms);
         dmma_times.push_back(tile_compatible_dmma_ms);
         combined_times.push_back(combined_ms);
         single_shot_all_cost_times.push_back(single_shot_all_cost_ms);
+        const double symbolic_stage_ms =
+            dmma_stats.candidate_ms + dmma_stats.symbolic_ms;
+        const double allocation_stage_ms = dmma_stats.allocation_ms;
+        const double numeric_stage_ms =
+            dmma_stats.scheduler_ms + dmma_stats.numeric_ms;
+        symbolic_stage_times.push_back(symbolic_stage_ms);
+        allocation_stage_times.push_back(allocation_stage_ms);
+        numeric_stage_times.push_back(numeric_stage_ms);
+        flex_style_total_times.push_back(
+            update_stats.total_ms + symbolic_stage_ms +
+            allocation_stage_ms + numeric_stage_ms);
         if (materialize_output)
         {
             export_times.push_back(dmma_stats.output_copy_ms);
@@ -2974,18 +2436,7 @@ int main(int argc, char **argv)
                 : 0.0;
         std::printf(
             "TASK_SPLIT iteration=%d schedule=%s direct_layout=%s "
-            "row_static_used=%d row_static_ctas=%d "
-            "row_static_unique_sms=%d row_static_mapping_valid=%d "
-            "row_static_mapping_audit_core_excluded=1 "
-            "row_dynamic_used=%d row_dynamic_ctas=%d "
-            "row_dynamic_unique_sms=%d row_dynamic_mapping_valid=%d "
-            "row_dynamic_queue_batch=%d "
-            "row_dynamic_atomic_claims=%d row_dynamic_final_head=%d "
-            "row_dynamic_expected_atomic_claims=%d "
-            "row_dynamic_expected_final_head=%d "
-            "row_dynamic_claims=%d row_dynamic_claims_valid=%d "
-            "row_dynamic_audit_core_excluded=1 "
-            "row_dynamic_queue_setup_internal_core_excluded=1 reduction=%s "
+                    "reduction=%s "
             "requested_reduction=%s heavy_tasks=%d "
             "early_split_requested=%d early_split_used=%d "
             "early_heavy_worker_cap=%d early_heavy_worker_blocks=%d "
@@ -3041,21 +2492,6 @@ int main(int argc, char **argv)
                                     dmma_stats.cost_balanced_requested),
             dmma_direct_numeric_layout_name(
                 dmma_stats.direct_numeric_layout),
-            dmma_stats.row_static_used ? 1 : 0,
-            dmma_stats.row_static_ctas,
-            dmma_stats.row_static_unique_sms,
-            dmma_stats.row_static_mapping_valid ? 1 : 0,
-            dmma_stats.row_dynamic_used ? 1 : 0,
-            dmma_stats.row_dynamic_ctas,
-            dmma_stats.row_dynamic_unique_sms,
-            dmma_stats.row_dynamic_mapping_valid ? 1 : 0,
-            dmma_stats.row_dynamic_queue_batch,
-            dmma_stats.row_dynamic_claims,
-            dmma_stats.row_dynamic_final_head,
-            dmma_stats.row_dynamic_expected_claims,
-            dmma_stats.row_dynamic_expected_final_head,
-            dmma_stats.row_dynamic_claims,
-            dmma_stats.row_dynamic_claims_valid ? 1 : 0,
             reduction_name(dmma_stats.reduction_mode),
             reduction_name(schedule_config.reduction),
             dmma_stats.heavy_tasks,
@@ -3245,19 +2681,7 @@ int main(int argc, char **argv)
             "operand_index_prepare_ms=%.6f timing_scope=tilespgemm-compatible "
             "b_update_ms=%.6f b_update_wall_ms=%.6f "
             "b_update_mode=%s dmma_ms=%.6f "
-            "schedule=%s direct_layout=%s row_static_used=%d "
-            "row_static_ctas=%d row_static_unique_sms=%d "
-            "row_static_mapping_valid=%d "
-            "row_static_mapping_audit_core_excluded=1 "
-            "row_dynamic_used=%d row_dynamic_ctas=%d "
-            "row_dynamic_unique_sms=%d row_dynamic_mapping_valid=%d "
-            "row_dynamic_queue_batch=%d "
-            "row_dynamic_atomic_claims=%d row_dynamic_final_head=%d "
-            "row_dynamic_expected_atomic_claims=%d "
-            "row_dynamic_expected_final_head=%d "
-            "row_dynamic_claims=%d row_dynamic_claims_valid=%d "
-            "row_dynamic_audit_core_excluded=1 "
-            "row_dynamic_queue_setup_internal_core_excluded=1 "
+            "schedule=%s direct_layout=%s "
             "candidate_ms=%.6f exact_mask_ms=%.6f "
             "exact_kernel_ms=%.6f symbolic_finalize_ms=%.6f "
             "output_payload_allocation_ms=%.6f "
@@ -3292,21 +2716,6 @@ int main(int argc, char **argv)
                                     dmma_stats.cost_balanced_requested),
             dmma_direct_numeric_layout_name(
                 dmma_stats.direct_numeric_layout),
-            dmma_stats.row_static_used ? 1 : 0,
-            dmma_stats.row_static_ctas,
-            dmma_stats.row_static_unique_sms,
-            dmma_stats.row_static_mapping_valid ? 1 : 0,
-            dmma_stats.row_dynamic_used ? 1 : 0,
-            dmma_stats.row_dynamic_ctas,
-            dmma_stats.row_dynamic_unique_sms,
-            dmma_stats.row_dynamic_mapping_valid ? 1 : 0,
-            dmma_stats.row_dynamic_queue_batch,
-            dmma_stats.row_dynamic_claims,
-            dmma_stats.row_dynamic_final_head,
-            dmma_stats.row_dynamic_expected_claims,
-            dmma_stats.row_dynamic_expected_final_head,
-            dmma_stats.row_dynamic_claims,
-            dmma_stats.row_dynamic_claims_valid ? 1 : 0,
             dmma_stats.candidate_ms,
             dmma_stats.symbolic_ms, dmma_stats.exact_kernel_ms,
             dmma_stats.symbolic_finalize_ms, dmma_stats.allocation_ms,
@@ -3383,17 +2792,7 @@ int main(int argc, char **argv)
                 options.warmup_iterations, options.iterations);
     print_samples(combined_times);
     std::printf(" min_ms=%.6f median_ms=%.6f max_ms=%.6f "
-                "schedule=%s direct_layout=%s row_queue_batch=%d "
-                "row_dynamic_auto=%d row_dynamic_threshold=%.9f "
-                "row_static_ctas=%d "
-                "row_static_min_unique_sms=%d "
-                "row_static_all_mapping_valid=%d "
-                "row_static_mapping_audit_core_excluded=1 "
-                "row_dynamic_ctas=%d row_dynamic_min_unique_sms=%d "
-                "row_dynamic_all_mapping_valid=%d "
-                "row_dynamic_all_claims_valid=%d "
-                "row_dynamic_audit_core_excluded=1 "
-                "row_dynamic_queue_setup_internal_core_excluded=1 "
+                "schedule=%s direct_layout=%s "
                 "reduction=%s requested_reduction=%s "
                 "launch_policy=%s light_policy=%s critical_q_min=%.9f "
                 "suffix_auto_basis=%s "
@@ -3406,28 +2805,6 @@ int main(int argc, char **argv)
                                         schedule_config.cost_balanced),
                 dmma_direct_numeric_layout_name(
                     summary_direct_numeric_layout),
-                schedule_config.row_queue_batch,
-                schedule_config.row_dynamic_auto ? 1 : 0,
-                schedule_config.row_dynamic_threshold,
-                summary_row_static_ctas,
-                summary_row_static_min_unique_sms,
-                summary_direct_numeric_layout ==
-                        DMMA_DIRECT_NUMERIC_ROW_STATIC &&
-                    summary_row_static_mapping_valid
-                    ? 1
-                    : 0,
-                summary_row_dynamic_ctas,
-                summary_row_dynamic_min_unique_sms,
-                summary_direct_numeric_layout ==
-                        DMMA_DIRECT_NUMERIC_ROW_DYNAMIC &&
-                    summary_row_dynamic_mapping_valid
-                    ? 1
-                    : 0,
-                summary_direct_numeric_layout ==
-                        DMMA_DIRECT_NUMERIC_ROW_DYNAMIC &&
-                    summary_row_dynamic_claims_valid
-                    ? 1
-                    : 0,
                 reduction_name(summary_effective_reduction),
                 reduction_name(schedule_config.reduction),
                 launch_policy_name(schedule_config.launch_policy),
@@ -3459,6 +2836,58 @@ int main(int argc, char **argv)
         b_values_clear_timed_samples, b_values_noclear_timed_samples,
         b_values_clear_fallback_timed_samples,
         options.b_values_clear_policy == DMMA_B_VALUES_ALWAYS_CLEAR ? 1 : 0);
+
+    if (stdout_suppressed)
+    {
+        std::fflush(stdout);
+        dup2(saved_stdout_fd, STDOUT_FILENO);
+        close(saved_stdout_fd);
+        saved_stdout_fd = -1;
+        stdout_suppressed = false;
+    }
+    if (!flex_style_total_times.empty())
+    {
+        std::vector<std::size_t> order(flex_style_total_times.size());
+        for (std::size_t index = 0; index < order.size(); ++index)
+            order[index] = index;
+        std::sort(order.begin(), order.end(),
+                  [&](std::size_t lhs, std::size_t rhs) {
+                      return flex_style_total_times[lhs] <
+                             flex_style_total_times[rhs];
+                  });
+        const std::size_t selected = order[order.size() / 2];
+        const double runtime_ms = flex_style_total_times[selected];
+        const double gflops = runtime_ms > 0.0
+            ? 2.0 * static_cast<double>(nnz_cub) / (runtime_ms * 1.0e6)
+            : 0.0;
+        std::printf("RTT-SpGEMM (%s), repeats = %d, statistic = median\n",
+                    effective_schedule_name(schedule_config.mode,
+                                            schedule_config.cost_balanced),
+                    options.iterations);
+        std::printf("B permutation runtime is %.3f ms\n",
+                    b_update_times[selected]);
+        std::printf("Symbolic runtime is %.3f ms\n",
+                    symbolic_stage_times[selected]);
+        std::printf("Malloc runtime is %.3f ms\n",
+                    allocation_stage_times[selected]);
+        std::printf("Numeric runtime is %.3f ms\n",
+                    numeric_stage_times[selected]);
+        std::printf("CUDA  RTT-SpGEMM runtime is %.3f ms, gflops = %.2f\n",
+                    runtime_ms, gflops);
+        std::printf("RTT_RESULT matrix=%s mode=%s repeats=%d statistic=median "
+                    "selected_iteration=%zu b_permutation_ms=%.6f "
+                    "symbolic_ms=%.6f malloc_ms=%.6f "
+                    "numeric_ms=%.6f runtime_ms=%.6f gflops=%.6f "
+                    "input_h2d_included=0 output_d2h_included=0 "
+                    "validation_included=0 capacity_workspace_reuse=0\n",
+                    options.a_filename,
+                    effective_schedule_name(schedule_config.mode,
+                                            schedule_config.cost_balanced),
+                    options.iterations, selected + 1,
+                    b_update_times[selected], symbolic_stage_times[selected],
+                    allocation_stage_times[selected],
+                    numeric_stage_times[selected], runtime_ms, gflops);
+    }
 
     if (!cusparse_runs_first && core_target_runs_cusparse &&
         !run_requested_cusparse_benchmarks(
@@ -3520,6 +2949,14 @@ cleanup:
     destroy_prepared_a(&prepared_a);
     free_host_csr(&host_b);
     free_host_csr(&host_a);
+    if (stdout_suppressed)
+    {
+        std::fflush(stdout);
+        dup2(saved_stdout_fd, STDOUT_FILENO);
+        close(saved_stdout_fd);
+        saved_stdout_fd = -1;
+        stdout_suppressed = false;
+    }
     std::printf("---------------------------------------------------------------\n");
     return status;
 }

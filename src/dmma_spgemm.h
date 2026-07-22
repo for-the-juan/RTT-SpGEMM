@@ -287,18 +287,11 @@ enum DmmaNumericScheduleMode
     DMMA_SCHEDULE_TILE_EARLY_SPLIT = 5
 };
 
-/* Direct symbolic work is identical for all layouts.  TILE_DYNAMIC retains
- * the ordinary one-C-tile-per-warp grid whose queued CTAs are dynamically
- * placed by CUDA.  ROW_STATIC is a deliberately weak scheduling baseline:
- * one persistent logical worker CTA owns one contiguous equal-row-count
- * block, with no queue, stealing, or cost model.  ROW_DYNAMIC is its pure
- * load-balancing ablation: the launch shape and per-row work are unchanged,
- * but each worker claims its next C-tile row from one global atomic head. */
+/* Direct numeric uses either production tile-dynamic mapping or the
+ * occupancy-matched parent-major tile-static ablation. */
 enum DmmaDirectNumericLayout
 {
     DMMA_DIRECT_NUMERIC_TILE_DYNAMIC = 0,
-    DMMA_DIRECT_NUMERIC_ROW_STATIC = 1,
-    DMMA_DIRECT_NUMERIC_ROW_DYNAMIC = 2,
     /* Fixed persistent CTA/warp ownership with cyclic tile assignment. */
     DMMA_DIRECT_NUMERIC_TILE_STATIC = 3
 };
@@ -308,10 +301,6 @@ static inline const char *dmma_direct_numeric_layout_name(
 {
     switch (layout)
     {
-    case DMMA_DIRECT_NUMERIC_ROW_STATIC:
-        return "row-static-block";
-    case DMMA_DIRECT_NUMERIC_ROW_DYNAMIC:
-        return "row-dynamic";
     case DMMA_DIRECT_NUMERIC_TILE_STATIC:
         return "tile-static";
     default:
@@ -687,17 +676,6 @@ struct DmmaNumericScheduleConfig
     DmmaNumericScheduleMode mode = DMMA_SCHEDULE_DIRECT;
     DmmaDirectNumericLayout direct_numeric_layout =
         DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
-    /* Row-dynamic reserves this many consecutive C tile rows per global
-     * fetch-add.  One is the frozen pure-LB behavior; two/four are explicit
-     * queue/locality ablations and are invalid for every other layout. */
-    int row_queue_batch = 1;
-    /* Default-off pre-numeric layout gate.  When requested, one bounded
-     * reduction over the already materialized exact C row pointer estimates
-     * the load of the existing contiguous row-static workers.  It selects
-     * one of the two existing row-worker kernel modes; it never changes the
-     * CTA shape or the work performed within a claimed C tile row. */
-    bool row_dynamic_auto = false;
-    double row_dynamic_threshold = 1.10;
     DmmaPartialReductionMode reduction = DMMA_REDUCTION_ATOMIC;
     DmmaLightPolicy light_policy = DMMA_LIGHT_STATIC;
     DmmaSplitLaunchPolicy launch_policy =
@@ -875,48 +853,6 @@ struct DmmaSpGemmStats
     int output_nnz = 0;
     DmmaDirectNumericLayout direct_numeric_layout =
         DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
-    bool row_static_used = false;
-    int row_static_ctas = 0;
-    int row_static_unique_sms = 0;
-    /* CUDA exposes no portable block-to-SM affinity.  A row-static sample is
-     * a strict row-to-SM mapping only when the post-Core CTA SM-ID audit finds
-     * one distinct SM for every logical worker CTA. */
-    bool row_static_mapping_valid = false;
-    bool row_dynamic_used = false;
-    int row_dynamic_ctas = 0;
-    int row_dynamic_unique_sms = 0;
-    /* The same placement audit is retained for a controlled static/dynamic
-     * comparison.  Dynamic correctness does not depend on one CTA per SM,
-     * but a sample is a strict pure-LB comparison only when both layouts
-     * observe the same distinct-SM worker placement. */
-    bool row_dynamic_mapping_valid = false;
-    int row_dynamic_queue_batch = 1;
-    /* Compatibility field: for batch=1 this is byte-for-byte the historical
-     * queue-head value.  For every batch it denotes the actual number of
-     * atomicAdd reservations, while final_head records the fetched counter. */
-    int row_dynamic_claims = 0;
-    int row_dynamic_final_head = 0;
-    int row_dynamic_expected_claims = 0;
-    int row_dynamic_expected_final_head = 0;
-    bool row_dynamic_claims_valid = false;
-    /* exact-row-ptr-v1 auto-layout telemetry.  All values are generated
-     * before numeric and the complete reduction/D2H/dispatch wall time is
-     * part of Core.  Diagnostic printing happens only after the endpoint. */
-    bool row_gate_requested = false;
-    bool row_gate_used = false;
-    bool row_gate_valid = false;
-    bool row_gate_decision_dynamic = false;
-    int row_gate_rows = 0;
-    int row_gate_workers = 0;
-    int row_gate_zero_workers = 0;
-    unsigned long long row_gate_exact_tiles = 0;
-    unsigned long long row_gate_load_sum = 0;
-    unsigned long long row_gate_load_max = 0;
-    double row_gate_load_sum_sq = 0.0;
-    double row_gate_static_max_over_mean = 1.0;
-    double row_gate_static_cv = 0.0;
-    double row_gate_threshold = 1.10;
-    double row_gate_reduction_ms = 0.0;
     int heavy_tasks = 0;
     int critical_q_begin = 0;
     int prefix_tasks = 0;
@@ -5613,427 +5549,6 @@ __global__ void dmma_numeric_low_fill_exact_tile_kernel(
 #endif
 }
 
-static __host__ __device__ __forceinline__ int
-dmma_row_static_worker_count(int c_tile_rows, int sm_count)
-{
-    if (c_tile_rows <= 0 || sm_count <= 0)
-        return 0;
-    return c_tile_rows < sm_count ? c_tile_rows : sm_count;
-}
-
-static __host__ __device__ __forceinline__ int
-dmma_row_static_worker_row_begin(int worker, int c_tile_rows,
-                                 int worker_count)
-{
-    if (worker < 0 || worker > worker_count || c_tile_rows < 0 ||
-        worker_count <= 0)
-        return -1;
-    return static_cast<int>(
-        static_cast<long long>(worker) * c_tile_rows / worker_count);
-}
-
-static __host__ __device__ __forceinline__ int
-dmma_row_static_owner_cta(int c_tile_row, int c_tile_rows,
-                          int worker_count)
-{
-    if (c_tile_row < 0 || c_tile_row >= c_tile_rows ||
-        worker_count <= 0)
-        return -1;
-    /* Invert [floor(pR/P), floor((p+1)R/P)).  P<=R, so every interval is
-     * non-empty and the ceil expression selects exactly one owner. */
-    return static_cast<int>(
-        (static_cast<long long>(c_tile_row + 1) * worker_count - 1) /
-        c_tile_rows);
-}
-
-static __host__ __device__ __forceinline__ int
-dmma_row_static_owner_warp(int task, int row_begin)
-{
-    if (task < row_begin)
-        return -1;
-    return (task - row_begin) % DMMA_WARPS_PER_BLOCK;
-}
-
-static __host__ __device__ __forceinline__ int
-dmma_row_queue_batch_valid(int row_queue_batch)
-{
-    return row_queue_batch == 1 || row_queue_batch == 2 ||
-           row_queue_batch == 4;
-}
-
-/* exact-row-ptr-v1 is intentionally A100-scoped for the frozen experiment:
- * the existing row-worker launch uses P=min(S,R), and the target has 108 SMs.
- * Keeping the bound explicit prevents an unreviewed architecture-dependent
- * change in either the reduction or the worker launch shape. */
-constexpr int DMMA_ROW_GATE_MAX_WORKERS = 108;
-constexpr int DMMA_ROW_GATE_MAX_THREADS = 128;
-
-struct DmmaRowGateDeviceSummary
-{
-    unsigned long long load_sum = 0;
-    unsigned long long load_max = 0;
-    unsigned long long exact_tiles = 0;
-    double load_sum_sq = 0.0;
-    int rows = 0;
-    int workers = 0;
-    int zero_workers = 0;
-    int invalid_intervals = 0;
-};
-
-struct DmmaRowGateFeatures
-{
-    bool valid = false;
-    double static_max_over_mean = 1.0;
-    double static_cv = 0.0;
-};
-
-static __host__ __device__ constexpr int
-dmma_row_gate_reduction_threads(int workers)
-{
-    if (workers <= 0 || workers > DMMA_ROW_GATE_MAX_WORKERS)
-        return 0;
-    int threads = 1;
-    while (threads < workers)
-        threads <<= 1;
-    return threads <= DMMA_ROW_GATE_MAX_THREADS ? threads : 0;
-}
-
-/* CPU reference and fixture helper.  Production consumes exactly the same
- * two row-pointer endpoints per logical worker in the CUDA kernel below. */
-static inline DmmaRowGateDeviceSummary dmma_row_gate_host_summary(
-    const int *output_row_ptr, int rows, int workers)
-{
-    DmmaRowGateDeviceSummary summary{};
-    summary.rows = rows;
-    summary.workers = workers;
-    if (output_row_ptr == nullptr || rows <= 0 || workers <= 0 ||
-        workers > DMMA_ROW_GATE_MAX_WORKERS || workers > rows)
-    {
-        summary.invalid_intervals = 1;
-        return summary;
-    }
-    const int terminal = output_row_ptr[rows];
-    if (terminal < 0)
-        ++summary.invalid_intervals;
-    else
-        summary.exact_tiles = static_cast<unsigned long long>(terminal);
-    for (int worker = 0; worker < workers; ++worker)
-    {
-        const int row_begin = dmma_row_static_worker_row_begin(
-            worker, rows, workers);
-        const int row_end = dmma_row_static_worker_row_begin(
-            worker + 1, rows, workers);
-        if (row_begin < 0 || row_end <= row_begin || row_end > rows ||
-            output_row_ptr[row_begin] < 0 ||
-            output_row_ptr[row_end] < output_row_ptr[row_begin])
-        {
-            ++summary.invalid_intervals;
-            continue;
-        }
-        const unsigned long long load =
-            static_cast<unsigned long long>(output_row_ptr[row_end] -
-                                            output_row_ptr[row_begin]);
-        summary.load_sum += load;
-        summary.load_max = summary.load_max < load ? load : summary.load_max;
-        const double load_double = static_cast<double>(load);
-        summary.load_sum_sq += load_double * load_double;
-        summary.zero_workers += load == 0 ? 1 : 0;
-    }
-    return summary;
-}
-
-static inline DmmaRowGateFeatures dmma_row_gate_features(
-    const DmmaRowGateDeviceSummary &summary, int expected_rows,
-    int expected_workers, int expected_exact_tiles)
-{
-    DmmaRowGateFeatures features{};
-    const bool structural_valid =
-        expected_rows > 0 && expected_workers > 0 &&
-        expected_workers <= DMMA_ROW_GATE_MAX_WORKERS &&
-        expected_workers <= expected_rows && expected_exact_tiles >= 0 &&
-        summary.rows == expected_rows &&
-        summary.workers == expected_workers &&
-        summary.invalid_intervals == 0 && summary.zero_workers >= 0 &&
-        summary.zero_workers <= expected_workers &&
-        summary.exact_tiles ==
-            static_cast<unsigned long long>(expected_exact_tiles) &&
-        summary.load_sum == summary.exact_tiles &&
-        summary.load_max <= summary.load_sum &&
-        std::isfinite(summary.load_sum_sq) && summary.load_sum_sq >= 0.0;
-    if (!structural_valid)
-        return features;
-    if (summary.load_sum == 0)
-    {
-        features.valid = true;
-        return features;
-    }
-    const double mean = static_cast<double>(summary.load_sum) /
-                        static_cast<double>(expected_workers);
-    double variance = summary.load_sum_sq /
-                          static_cast<double>(expected_workers) -
-                      mean * mean;
-    if (variance < 0.0 && variance > -1.0e-9 * mean * mean)
-        variance = 0.0;
-    if (!(mean > 0.0) || variance < 0.0 || !std::isfinite(variance))
-        return features;
-    features.static_max_over_mean =
-        static_cast<double>(summary.load_max) / mean;
-    features.static_cv = std::sqrt(variance) / mean;
-    features.valid = std::isfinite(features.static_max_over_mean) &&
-                     features.static_max_over_mean >= 1.0 &&
-                     std::isfinite(features.static_cv) &&
-                     features.static_cv >= 0.0;
-    return features;
-}
-
-static inline bool dmma_row_gate_select_dynamic(
-    const DmmaRowGateDeviceSummary &summary,
-    const DmmaRowGateFeatures &features, double threshold)
-{
-    return features.valid && summary.load_sum > 0 &&
-           std::isfinite(threshold) && threshold >= 1.0 &&
-           features.static_max_over_mean >= threshold;
-}
-
-__global__ void dmma_row_gate_exact_row_ptr_kernel(
-    const int *__restrict__ output_row_ptr, int rows, int workers,
-    DmmaRowGateDeviceSummary *__restrict__ output)
-{
-    __shared__ unsigned long long load_sum[DMMA_ROW_GATE_MAX_THREADS];
-    __shared__ unsigned long long load_max[DMMA_ROW_GATE_MAX_THREADS];
-    __shared__ double load_sum_sq[DMMA_ROW_GATE_MAX_THREADS];
-    __shared__ int zero_workers[DMMA_ROW_GATE_MAX_THREADS];
-    __shared__ int invalid_intervals[DMMA_ROW_GATE_MAX_THREADS];
-    const int thread = static_cast<int>(threadIdx.x);
-    unsigned long long load = 0;
-    int invalid = 0;
-    if (thread < workers)
-    {
-        const int row_begin = dmma_row_static_worker_row_begin(
-            thread, rows, workers);
-        const int row_end = dmma_row_static_worker_row_begin(
-            thread + 1, rows, workers);
-        const int begin_value = row_begin >= 0 && row_begin <= rows
-                                    ? output_row_ptr[row_begin]
-                                    : -1;
-        const int end_value = row_end >= 0 && row_end <= rows
-                                  ? output_row_ptr[row_end]
-                                  : -1;
-        if (row_begin < 0 || row_end <= row_begin || row_end > rows ||
-            begin_value < 0 || end_value < begin_value)
-            invalid = 1;
-        else
-            load = static_cast<unsigned long long>(end_value - begin_value);
-    }
-    load_sum[thread] = load;
-    load_max[thread] = load;
-    const double load_double = static_cast<double>(load);
-    load_sum_sq[thread] = load_double * load_double;
-    zero_workers[thread] = thread < workers && load == 0 ? 1 : 0;
-    invalid_intervals[thread] = invalid;
-    __syncthreads();
-    for (int stride = static_cast<int>(blockDim.x) >> 1; stride > 0;
-         stride >>= 1)
-    {
-        if (thread < stride)
-        {
-            load_sum[thread] += load_sum[thread + stride];
-            load_max[thread] =
-                load_max[thread] < load_max[thread + stride]
-                    ? load_max[thread + stride]
-                    : load_max[thread];
-            load_sum_sq[thread] += load_sum_sq[thread + stride];
-            zero_workers[thread] += zero_workers[thread + stride];
-            invalid_intervals[thread] += invalid_intervals[thread + stride];
-        }
-        __syncthreads();
-    }
-    if (thread == 0)
-    {
-        output->load_sum = load_sum[0];
-        output->load_max = load_max[0];
-        output->load_sum_sq = load_sum_sq[0];
-        output->exact_tiles = output_row_ptr[rows] >= 0
-                                  ? static_cast<unsigned long long>(
-                                        output_row_ptr[rows])
-                                  : 0ull;
-        output->rows = rows;
-        output->workers = workers;
-        output->zero_workers = zero_workers[0];
-        output->invalid_intervals =
-            invalid_intervals[0] + (output_row_ptr[rows] < 0 ? 1 : 0);
-    }
-}
-
-static __host__ __device__ __forceinline__ int
-dmma_row_dynamic_expected_atomic_claims(int c_tile_rows, int worker_count,
-                                        int row_queue_batch)
-{
-    if (c_tile_rows < 0 || worker_count < 0 ||
-        !dmma_row_queue_batch_valid(row_queue_batch))
-        return -1;
-    const long long valid_batches =
-        (static_cast<long long>(c_tile_rows) + row_queue_batch - 1) /
-        row_queue_batch;
-    const long long claims = valid_batches + worker_count;
-    return claims <= INT_MAX ? static_cast<int>(claims) : -1;
-}
-
-static __host__ __device__ __forceinline__ int
-dmma_row_dynamic_expected_final_head(int c_tile_rows, int worker_count,
-                                     int row_queue_batch)
-{
-    const int claims = dmma_row_dynamic_expected_atomic_claims(
-        c_tile_rows, worker_count, row_queue_batch);
-    if (claims < 0)
-        return -1;
-    const long long head =
-        static_cast<long long>(claims) * row_queue_batch;
-    return head <= INT_MAX ? static_cast<int>(head) : -1;
-}
-
-/* Frozen batch=1 compatibility helper. */
-static __host__ __device__ __forceinline__ int
-dmma_row_dynamic_expected_claims(int c_tile_rows, int worker_count)
-{
-    return dmma_row_dynamic_expected_atomic_claims(c_tile_rows, worker_count,
-                                                   1);
-}
-
-template <bool VisitOnly>
-__device__ __forceinline__ void dmma_numeric_row_worker_process_row(
-    DmmaDeviceTiles a, DmmaDeviceTiles b, int c_tile_row_count,
-    int output_tile_count, const int *__restrict__ output_tile_row_ptr,
-    const int *__restrict__ output_rows, const int *__restrict__ output_cols,
-    const uint64_t *__restrict__ output_masks,
-    const int *__restrict__ output_offsets,
-    unsigned char *__restrict__ output_row_ptr,
-    unsigned char *__restrict__ output_col_idx,
-    MAT_VAL_TYPE *__restrict__ output_values,
-    int *__restrict__ row_visit_counts,
-    int *__restrict__ task_visit_counts, int row, int lane, int local_warp,
-    MAT_VAL_TYPE *__restrict__ tile_a_values,
-    MAT_VAL_TYPE *__restrict__ tile_b_values,
-    MAT_VAL_TYPE *__restrict__ tile_c_values)
-{
-    (void)c_tile_row_count;
-    if constexpr (VisitOnly)
-    {
-        if (lane == 0 && local_warp == 0 && row_visit_counts != nullptr)
-            atomicAdd(row_visit_counts + row, 1);
-    }
-    const int begin = output_tile_row_ptr[row];
-    const int end = output_tile_row_ptr[row + 1];
-    for (int task = begin + local_warp; task < end;
-         task += DMMA_WARPS_PER_BLOCK)
-    {
-        if constexpr (VisitOnly)
-        {
-            if (lane == 0 && task_visit_counts != nullptr)
-                atomicAdd(task_visit_counts + task, 1);
-        }
-        else
-        {
-            dmma_numeric_regular_task(
-                a, b, output_tile_count, output_rows, output_cols,
-                output_masks, output_offsets, output_row_ptr,
-                output_col_idx, output_values, task, lane,
-                tile_a_values, tile_b_values, tile_c_values);
-        }
-    }
-}
-
-/* One binary implements the controlled row-static-block/row-dynamic pair, so
- * both modes have exactly the same compiled register and shared-memory
- * resources.  Both launch P=min(S,R) 128-thread/four-warp worker CTAs and use
- * the same per-row primitive above.  Static CTA p owns the contiguous block
- * [floor(pR/P),floor((p+1)R/P)); dynamic differs only by claiming each next
- * row batch with atomicAdd(next_row,row_queue_batch).  Batch one is the pure
- * row-level LB anchor; batch two/four only coarsen reservation granularity for
- * the queue/locality ablation.  Neither path uses a cost model, row sort,
- * heavy-tile split, work reuse, oversubscribed grid, or SM affinity.
- *
- * The dynamic claimed-row broadcast aliases shared_a only between rows.  The
- * second CTA barrier makes every thread capture the row before warp 0 reuses
- * that location for decoded A values.  CUDA placement remains non-contractual
- * and is audited after the Core endpoint for both modes. */
-template <bool VisitOnly = false>
-__global__ void dmma_numeric_row_worker_kernel(
-    DmmaDeviceTiles a, DmmaDeviceTiles b, int c_tile_row_count,
-    int output_tile_count, const int *__restrict__ output_tile_row_ptr,
-    const int *__restrict__ output_rows, const int *__restrict__ output_cols,
-    const uint64_t *__restrict__ output_masks,
-    const int *__restrict__ output_offsets,
-    unsigned char *__restrict__ output_row_ptr,
-    unsigned char *__restrict__ output_col_idx,
-    MAT_VAL_TYPE *__restrict__ output_values,
-    int dynamic_rows, int row_queue_batch, int *__restrict__ next_row,
-    uint32_t *__restrict__ worker_sm_ids,
-    int *__restrict__ row_visit_counts,
-    int *__restrict__ task_visit_counts)
-{
-    const int lane = threadIdx.x & (WARP_SIZE - 1);
-    const int local_warp = threadIdx.x / WARP_SIZE;
-    if (threadIdx.x == 0 && worker_sm_ids != nullptr)
-        worker_sm_ids[blockIdx.x] = dmma_schedule_smid();
-
-    __shared__ MAT_VAL_TYPE
-        shared_a[DMMA_WARPS_PER_BLOCK * DMMA_INPUT_ELEMS];
-    __shared__ MAT_VAL_TYPE
-        shared_b[DMMA_WARPS_PER_BLOCK * DMMA_INPUT_ELEMS];
-    __shared__ MAT_VAL_TYPE
-        shared_c[DMMA_WARPS_PER_BLOCK * DMMA_OUTPUT_ELEMS];
-    MAT_VAL_TYPE *tile_a_values =
-        shared_a + local_warp * DMMA_INPUT_ELEMS;
-    MAT_VAL_TYPE *tile_b_values =
-        shared_b + local_warp * DMMA_INPUT_ELEMS;
-    MAT_VAL_TYPE *tile_c_values =
-        shared_c + local_warp * DMMA_OUTPUT_ELEMS;
-    int *claimed_row_slot = reinterpret_cast<int *>(shared_a);
-
-    if (dynamic_rows != 0)
-    {
-        while (true)
-        {
-            if (threadIdx.x == 0)
-                *claimed_row_slot = atomicAdd(next_row, row_queue_batch);
-            __syncthreads();
-            const int batch_begin = *claimed_row_slot;
-            __syncthreads();
-            if (batch_begin >= c_tile_row_count)
-                break;
-            const int batch_end =
-                batch_begin < c_tile_row_count - row_queue_batch
-                    ? batch_begin + row_queue_batch
-                    : c_tile_row_count;
-            for (int row = batch_begin; row < batch_end; ++row)
-                dmma_numeric_row_worker_process_row<VisitOnly>(
-                    a, b, c_tile_row_count, output_tile_count,
-                    output_tile_row_ptr, output_rows, output_cols,
-                    output_masks, output_offsets, output_row_ptr,
-                    output_col_idx, output_values, row_visit_counts,
-                    task_visit_counts, row, lane, local_warp, tile_a_values,
-                    tile_b_values, tile_c_values);
-        }
-    }
-    else
-    {
-        const int first_row = dmma_row_static_worker_row_begin(
-            static_cast<int>(blockIdx.x), c_tile_row_count,
-            static_cast<int>(gridDim.x));
-        const int last_row = dmma_row_static_worker_row_begin(
-            static_cast<int>(blockIdx.x) + 1, c_tile_row_count,
-            static_cast<int>(gridDim.x));
-        for (int row = first_row; row < last_row; ++row)
-            dmma_numeric_row_worker_process_row<VisitOnly>(
-                a, b, c_tile_row_count, output_tile_count,
-                output_tile_row_ptr, output_rows, output_cols, output_masks,
-                output_offsets, output_row_ptr, output_col_idx, output_values,
-                row_visit_counts, task_visit_counts, row, lane, local_warp,
-                tile_a_values, tile_b_values, tile_c_values);
-    }
-}
-
 /* P17 transpose-packed layout.  Let R=ceil(chunk_count/W).  The first R CTAs
  * contain only chunk work: warp w in block b reads descriptor w*R+b, i.e. one
  * position from each contiguous descriptor partition.  With parent-major
@@ -6241,34 +5756,6 @@ __global__ void dmma_numeric_light_kernel(
         shared_a + local_warp * DMMA_INPUT_ELEMS,
         shared_b + local_warp * DMMA_INPUT_ELEMS,
         shared_c + local_warp * DMMA_OUTPUT_ELEMS);
-}
-
-/* Deliberately static tile baseline.  A fixed persistent warp owns the
- * cyclic sequence worker, worker+W, ...; there is no queue or stealing.
- * This keeps the per-tile Tensor Core primitive identical to tile-dynamic. */
-__global__ void dmma_numeric_tile_static_kernel(
-    DmmaDeviceTiles a, DmmaDeviceTiles b, int output_tile_count,
-    const int *__restrict__ output_rows, const int *__restrict__ output_cols,
-    const uint64_t *__restrict__ output_masks,
-    const int *__restrict__ output_offsets,
-    unsigned char *__restrict__ output_row_ptr,
-    unsigned char *__restrict__ output_col_idx,
-    MAT_VAL_TYPE *__restrict__ output_values)
-{
-    const int worker = static_cast<int>(dmma_global_thread_index() / WARP_SIZE);
-    const int workers = static_cast<int>(gridDim.x) * DMMA_WARPS_PER_BLOCK;
-    const int lane = threadIdx.x & (WARP_SIZE - 1);
-    const int local_warp = threadIdx.x / WARP_SIZE;
-    __shared__ MAT_VAL_TYPE shared_a[DMMA_WARPS_PER_BLOCK * DMMA_INPUT_ELEMS];
-    __shared__ MAT_VAL_TYPE shared_b[DMMA_WARPS_PER_BLOCK * DMMA_INPUT_ELEMS];
-    __shared__ MAT_VAL_TYPE shared_c[DMMA_WARPS_PER_BLOCK * DMMA_OUTPUT_ELEMS];
-    for (int task = worker; task < output_tile_count; task += workers)
-        dmma_numeric_regular_task(
-            a, b, output_tile_count, output_rows, output_cols, output_masks,
-            output_offsets, output_row_ptr, output_col_idx, output_values,
-            task, lane, shared_a + local_warp * DMMA_INPUT_ELEMS,
-            shared_b + local_warp * DMMA_INPUT_ELEMS,
-            shared_c + local_warp * DMMA_OUTPUT_ELEMS);
 }
 
 /* The prefix contains no admitted heavy parent after exact output-window
@@ -7034,31 +6521,17 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
         (schedule.direct_numeric_layout !=
              DMMA_DIRECT_NUMERIC_TILE_DYNAMIC &&
          schedule.direct_numeric_layout !=
-             DMMA_DIRECT_NUMERIC_ROW_STATIC &&
-         schedule.direct_numeric_layout !=
-             DMMA_DIRECT_NUMERIC_ROW_DYNAMIC &&
-         schedule.direct_numeric_layout !=
              DMMA_DIRECT_NUMERIC_TILE_STATIC) ||
         (schedule.mode != DMMA_SCHEDULE_DIRECT &&
          schedule.direct_numeric_layout !=
              DMMA_DIRECT_NUMERIC_TILE_DYNAMIC) ||
-        !dmma_row_queue_batch_valid(schedule.row_queue_batch) ||
-        (!schedule.row_dynamic_auto &&
-         schedule.direct_numeric_layout !=
-             DMMA_DIRECT_NUMERIC_ROW_DYNAMIC &&
-         schedule.row_queue_batch != 1) ||
-        (schedule.row_dynamic_auto &&
-         schedule.mode != DMMA_SCHEDULE_DIRECT) ||
         (schedule.cost_balanced &&
          (!schedule.tileflex16_symbolic ||
           schedule.mode != DMMA_SCHEDULE_DIRECT ||
-          schedule.row_dynamic_auto ||
           schedule.direct_numeric_layout !=
               DMMA_DIRECT_NUMERIC_TILE_DYNAMIC)) ||
         schedule.cost_workers_per_sm < 1 ||
         schedule.cost_workers_per_sm > 16 ||
-        !std::isfinite(schedule.row_dynamic_threshold) ||
-        schedule.row_dynamic_threshold < 1.0 ||
         !(schedule.split_threshold > 0.0) ||
         !std::isfinite(schedule.split_threshold) ||
         schedule.split_threshold > FLT_MAX ||
@@ -7135,7 +6608,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
         !std::isfinite(schedule.exact_forward_min_ratio) ||
         (schedule.exact_forward_spa &&
          (schedule.mode != DMMA_SCHEDULE_DIRECT ||
-          schedule.row_dynamic_auto ||
           schedule.direct_numeric_layout !=
               DMMA_DIRECT_NUMERIC_TILE_DYNAMIC ||
           schedule.symbolic_admission !=
@@ -7145,7 +6617,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
         (schedule.low_fill_exact_tile &&
          (!dmma_low_fill_q_valid(schedule.low_fill_q) ||
           schedule.mode != DMMA_SCHEDULE_DIRECT ||
-          schedule.row_dynamic_auto ||
           schedule.direct_numeric_layout !=
               DMMA_DIRECT_NUMERIC_TILE_DYNAMIC ||
           schedule.exact_forward_spa ||
@@ -7161,9 +6632,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     stats->schedule_mode = schedule.mode;
     stats->cost_balanced_requested = schedule.cost_balanced;
     stats->direct_numeric_layout = schedule.direct_numeric_layout;
-    stats->row_dynamic_queue_batch = schedule.row_queue_batch;
-    stats->row_gate_requested = schedule.row_dynamic_auto;
-    stats->row_gate_threshold = schedule.row_dynamic_threshold;
     stats->light_policy = schedule.light_policy;
     stats->suffix_auto_basis = schedule.suffix_auto_basis;
     stats->reduction_mode = schedule.reduction;
@@ -7293,11 +6761,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     DmmaChunkDescriptor *d_chunk_descriptors = nullptr;
     MAT_VAL_TYPE *d_partial_workspace = nullptr;
     uint32_t *d_chunk_sm_ids = nullptr;
-    uint32_t *d_row_worker_sm_ids = nullptr;
-    int *d_row_dynamic_next_row = nullptr;
-    DmmaRowGateDeviceSummary *d_row_gate_summary = nullptr;
-    int row_worker_count = 0;
-    int row_worker_device_sm_count = 0;
     int *d_persistent_queue_head = nullptr;
     unsigned long long *d_suffix_bulk_head = nullptr;
     unsigned long long *d_suffix_fine_head = nullptr;
@@ -7327,20 +6790,9 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     int symbolic_critical_task_begin = 0;
     bool admission_count_event_recorded = false;
     bool use_direct_numeric = schedule.mode == DMMA_SCHEDULE_DIRECT;
-    const bool row_dynamic_auto_requested =
-        use_direct_numeric && schedule.row_dynamic_auto;
-    bool row_static_requested =
-        use_direct_numeric && !row_dynamic_auto_requested &&
-        schedule.direct_numeric_layout == DMMA_DIRECT_NUMERIC_ROW_STATIC;
-    bool row_dynamic_requested =
-        use_direct_numeric && !row_dynamic_auto_requested &&
-        schedule.direct_numeric_layout == DMMA_DIRECT_NUMERIC_ROW_DYNAMIC;
     const bool tile_static_requested =
-        use_direct_numeric && !row_dynamic_auto_requested &&
+        use_direct_numeric &&
         schedule.direct_numeric_layout == DMMA_DIRECT_NUMERIC_TILE_STATIC;
-    bool row_worker_requested =
-        row_dynamic_auto_requested || row_static_requested ||
-        row_dynamic_requested;
     const bool flat_grid_requested =
         schedule.mode == DMMA_SCHEDULE_SPLIT_FLAT;
     const bool tile_tail_queue_requested =
@@ -7402,59 +6854,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     std::size_t timeline_slots = 0;
     const char *timeline_path = nullptr;
 #endif
-    /* Row-worker experiment infrastructure is prepared before the internal
-     * Core boundary: SM-placement audit storage and one identically prepared
-     * control head for both layouts (unused by static).  The timed kernels perform one
-     * uint32 SM-ID store per CTA; dynamic additionally performs only the row
-     * claims intrinsic to the scheduling policy. */
-    if (row_worker_requested && a.tile_row_count > 0)
-    {
-        int device = 0;
-        if (!dmma_cuda_ok(cudaGetDevice(&device),
-                          "read row-worker CUDA device") ||
-            !dmma_cuda_ok(cudaDeviceGetAttribute(
-                              &row_worker_device_sm_count,
-                              cudaDevAttrMultiProcessorCount, device),
-                          "read row-worker SM count"))
-            return false;
-        row_worker_count = dmma_row_static_worker_count(
-            a.tile_row_count, row_worker_device_sm_count);
-        if (row_worker_count <= 0 ||
-            (row_dynamic_auto_requested &&
-             row_worker_count > DMMA_ROW_GATE_MAX_WORKERS) ||
-            dmma_row_dynamic_expected_final_head(
-                a.tile_row_count, row_worker_count,
-                schedule.row_queue_batch) < 0 ||
-            !dmma_cuda_ok(cudaMalloc(
-                              reinterpret_cast<void **>(
-                                  &d_row_worker_sm_ids),
-                              static_cast<std::size_t>(
-                                  row_worker_count) *
-                                  sizeof(uint32_t)),
-                          "allocate row-worker SM IDs") ||
-            !dmma_cuda_ok(cudaMemset(
-                              d_row_worker_sm_ids, 0xff,
-                              static_cast<std::size_t>(
-                                  row_worker_count) *
-                                  sizeof(uint32_t)),
-                          "clear row-worker SM IDs") ||
-            !dmma_cuda_ok(cudaMalloc(
-                              reinterpret_cast<void **>(
-                                  &d_row_dynamic_next_row),
-                              sizeof(*d_row_dynamic_next_row)),
-                          "allocate row-worker control head") ||
-            !dmma_cuda_ok(cudaMemset(
-                              d_row_dynamic_next_row, 0,
-                              sizeof(*d_row_dynamic_next_row)),
-                          "initialize row-worker control head") ||
-            !dmma_cuda_ok(cudaDeviceSynchronize(),
-                          "complete untimed row-worker setup"))
-        {
-            cudaFree(d_row_worker_sm_ids);
-            cudaFree(d_row_dynamic_next_row);
-            return false;
-        }
-    }
     gettimeofday(&total_begin, nullptr);
     if (schedule.tileflex16_symbolic)
     {
@@ -7507,7 +6906,7 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
                 &super16_output,
                 schedule.cost_balanced ||
                     (collect_sparse_tail_records && !tileflex_tail_cache_hit),
-                true))
+                schedule.mode != DMMA_SCHEDULE_DIRECT))
             goto failure;
         const auto super16_symbolic_end = std::chrono::steady_clock::now();
         stats->super16_parent_symbolic_wall_ms =
@@ -8103,8 +7502,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
             }
             cudaFree(d_output_nnz);
             cudaFree(d_output_row_ptr);
-            cudaFree(d_row_worker_sm_ids);
-            cudaFree(d_row_dynamic_next_row);
             return true;
         }
         goto numeric_phase;
@@ -8241,8 +7638,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
             stats->output_materialized = true;
         }
         cudaFree(d_candidate_row_ptr);
-        cudaFree(d_row_worker_sm_ids);
-        cudaFree(d_row_dynamic_next_row);
         return true;
     }
 
@@ -9077,8 +8472,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
         cudaFree(d_candidate_row_ptr);
         cudaFree(d_candidate_rows);
         cudaFree(d_candidate_cols);
-        cudaFree(d_row_worker_sm_ids);
-        cudaFree(d_row_dynamic_next_row);
         return true;
     }
 
@@ -9648,88 +9041,6 @@ static inline bool dmma_tilespgemm(const DmmaDeviceTiles &a,
     stats->output_nnz = output_nnz;
 
 numeric_phase:
-    if (row_dynamic_auto_requested)
-    {
-        timeval gate_begin{}, gate_end{};
-        DmmaRowGateDeviceSummary gate_summary{};
-        gettimeofday(&gate_begin, nullptr);
-        const int gate_threads =
-            dmma_row_gate_reduction_threads(row_worker_count);
-        if (gate_threads <= 0 || d_output_row_ptr == nullptr ||
-            output_tile_count <= 0 ||
-            !dmma_cuda_ok(cudaMalloc(
-                              reinterpret_cast<void **>(
-                                  &d_row_gate_summary),
-                              sizeof(*d_row_gate_summary)),
-                          "allocate exact-row-ptr gate summary"))
-            goto numeric_failure;
-        dmma_row_gate_exact_row_ptr_kernel<<<1, gate_threads>>>(
-            d_output_row_ptr, a.tile_row_count, row_worker_count,
-            d_row_gate_summary);
-        if (!dmma_cuda_ok(cudaGetLastError(),
-                          "launch exact-row-ptr gate reduction") ||
-            !dmma_cuda_ok(cudaMemcpy(
-                              &gate_summary, d_row_gate_summary,
-                              sizeof(gate_summary), cudaMemcpyDeviceToHost),
-                          "read exact-row-ptr gate summary"))
-            goto numeric_failure;
-        cudaFree(d_row_gate_summary);
-        d_row_gate_summary = nullptr;
-        const DmmaRowGateFeatures gate_features =
-            dmma_row_gate_features(
-                gate_summary, a.tile_row_count, row_worker_count,
-                output_tile_count);
-        /* A row worker serializes all C tiles belonging to the claimed row.
-         * It is therefore only a viable granularity for short rows.  The
-         * imbalance-only gate selected TSOPF (341 C tiles/row on average)
-         * and changed numeric from 3.6 ms to 44.5 ms.  Fail closed to the
-         * original tile-dynamic kernel when a row contains more than one
-         * eight-warp scheduling window on average; long-row tails need tile
-         * splitting, not whole-row ownership. */
-        constexpr double kRowDynamicMaximumMeanTiles = 32.0;
-        const double mean_tiles_per_row =
-            gate_summary.rows > 0
-                ? static_cast<double>(gate_summary.exact_tiles) /
-                      static_cast<double>(gate_summary.rows)
-                : 0.0;
-        const bool gate_dynamic =
-            mean_tiles_per_row <= kRowDynamicMaximumMeanTiles &&
-            dmma_row_gate_select_dynamic(
-                gate_summary, gate_features,
-                schedule.row_dynamic_threshold);
-        gettimeofday(&gate_end, nullptr);
-        stats->row_gate_reduction_ms =
-            dmma_elapsed_ms(gate_begin, gate_end);
-        stats->row_gate_used = true;
-        stats->row_gate_valid = gate_features.valid;
-        stats->row_gate_decision_dynamic = gate_dynamic;
-        stats->row_gate_rows = gate_summary.rows;
-        stats->row_gate_workers = gate_summary.workers;
-        stats->row_gate_zero_workers = gate_summary.zero_workers;
-        stats->row_gate_exact_tiles = gate_summary.exact_tiles;
-        stats->row_gate_load_sum = gate_summary.load_sum;
-        stats->row_gate_load_max = gate_summary.load_max;
-        stats->row_gate_load_sum_sq = gate_summary.load_sum_sq;
-        stats->row_gate_static_max_over_mean =
-            gate_features.static_max_over_mean;
-        stats->row_gate_static_cv = gate_features.static_cv;
-        if (!gate_features.valid)
-        {
-            std::fprintf(stderr,
-                         "Invalid exact-row-ptr-v1 gate reduction.\n");
-            goto numeric_failure;
-        }
-        row_dynamic_requested = gate_dynamic;
-        /* A rejected auto gate must preserve the production tile-dynamic
-         * baseline.  The previous experiment selected row-static here, which
-         * changed numeric even on matrices where balancing was predicted not
-         * to help. */
-        row_static_requested = false;
-        row_worker_requested = gate_dynamic;
-        stats->direct_numeric_layout =
-            gate_dynamic ? DMMA_DIRECT_NUMERIC_ROW_DYNAMIC
-                         : DMMA_DIRECT_NUMERIC_TILE_DYNAMIC;
-    }
     if (schedule.cost_balanced && output_tile_count > 0)
     {
         if (d_output_numeric_work == nullptr)
@@ -9800,36 +9111,19 @@ numeric_phase:
         stats->scheduler_ms += dmma_elapsed_ms(begin, end);
     }
     gettimeofday(&begin, nullptr);
-    if (!dmma_cuda_ok(cudaMalloc(
-                          reinterpret_cast<void **>(&d_output_tile_row_ptr),
-                          static_cast<std::size_t>(output_tile_count) *
-                              DMMA_TILE_M),
-                      "allocate C tile row offsets") ||
-        !dmma_cuda_ok(cudaMalloc(
-                          reinterpret_cast<void **>(&d_output_value_cols),
-                          static_cast<std::size_t>(output_nnz)),
-                      "allocate C value columns") ||
-        !dmma_cuda_ok(cudaMalloc(reinterpret_cast<void **>(&d_output_values),
-                                 static_cast<std::size_t>(output_nnz) *
-                                     sizeof(MAT_VAL_TYPE)),
-                      "allocate C values"))
+    d_output_tile_row_ptr =
+        rtt::super16::DeviceBuffer<unsigned char>::acquire(
+            static_cast<std::uint64_t>(output_tile_count) * DMMA_TILE_M,
+            "allocate C tile row offsets");
+    d_output_value_cols =
+        rtt::super16::DeviceBuffer<unsigned char>::acquire(
+            static_cast<std::uint64_t>(output_nnz),
+            "allocate C value columns");
+    d_output_values = rtt::super16::DeviceBuffer<MAT_VAL_TYPE>::acquire(
+        static_cast<std::uint64_t>(output_nnz), "allocate C values");
+    if (d_output_tile_row_ptr == nullptr || d_output_value_cols == nullptr ||
+        d_output_values == nullptr)
         goto numeric_failure;
-    if (row_worker_requested)
-    {
-        if (row_worker_count <= 0 || d_row_worker_sm_ids == nullptr ||
-            d_row_dynamic_next_row == nullptr)
-            goto numeric_failure;
-        if (row_static_requested)
-        {
-            stats->row_static_used = true;
-            stats->row_static_ctas = row_worker_count;
-        }
-        else
-        {
-            stats->row_dynamic_used = true;
-            stats->row_dynamic_ctas = row_worker_count;
-        }
-    }
     gettimeofday(&end, nullptr);
     stats->allocation_ms += dmma_elapsed_ms(begin, end);
 
@@ -10276,8 +9570,7 @@ numeric_phase:
 #ifdef DMMA_ENABLE_TIMELINE_TRACE
     /* The legacy trace format is one slot per dynamically scheduled output
      * warp and cannot represent persistent row workers. */
-    timeline_path = row_worker_requested ? nullptr :
-                                           std::getenv("DMMA_TRACE_FILE");
+    timeline_path = std::getenv("DMMA_TRACE_FILE");
     if (use_direct_numeric && timeline_path != nullptr &&
         *timeline_path != '\0')
     {
@@ -10333,9 +9626,9 @@ numeric_phase:
     {
         const bool c16_parent_direct =
             schedule.tileflex16_symbolic && use_direct_numeric &&
-            !schedule.cost_balanced && !row_worker_requested &&
+            !schedule.cost_balanced &&
             d_c16_parent_task_ids != nullptr;
-        if (!c16_parent_direct && !row_worker_requested &&
+        if (!c16_parent_direct &&
             numeric_blocks == 0 &&
             !dmma_launch_blocks(
                 static_cast<std::size_t>(output_tile_count),
@@ -10354,19 +9647,6 @@ numeric_phase:
                         d_output_masks, d_output_nnz,
                         d_output_tile_row_ptr, d_output_value_cols,
                         d_output_values);
-            }
-            else if (row_worker_requested)
-            {
-                dmma_numeric_row_worker_kernel<false>
-                    <<<static_cast<unsigned int>(row_worker_count),
-                       DMMA_THREADS_PER_BLOCK>>>(
-                        a, b, a.tile_row_count, output_tile_count,
-                        d_output_row_ptr, d_output_rows, d_output_cols,
-                        d_output_masks, d_output_nnz,
-                        d_output_tile_row_ptr, d_output_value_cols,
-                        d_output_values, row_dynamic_requested ? 1 : 0,
-                        schedule.row_queue_batch, d_row_dynamic_next_row,
-                        d_row_worker_sm_ids, nullptr, nullptr);
             }
             else
             {
@@ -10426,17 +9706,9 @@ numeric_phase:
             if (!dmma_cuda_ok(cudaGetLastError(),
                               schedule.cost_balanced
                                   ? "launch cost-balanced DMMA kernel"
-                                  : row_static_requested
-                                  ? "launch row-static-block DMMA kernel"
-                                  : (row_dynamic_requested
-                                         ? "launch row-dynamic DMMA kernel"
-                                         : "launch uniform DMMA kernel")) ||
+                                  : "launch uniform DMMA kernel") ||
                 !dmma_cuda_ok(cudaDeviceSynchronize(),
-                              row_static_requested
-                                  ? "row-static-block DMMA kernel"
-                                  : (row_dynamic_requested
-                                         ? "row-dynamic DMMA kernel"
-                                         : "uniform DMMA kernel")))
+                              "uniform DMMA kernel"))
                 goto numeric_failure;
             /* The synchronized native C is the direct-path Core endpoint;
              * numeric timing bookkeeping below must remain outside it. */
@@ -10970,33 +10242,6 @@ numeric_phase:
     if (!stats->core_completion_wall_valid)
         dmma_close_core_endpoint(total_begin, &total_end, stats);
 
-    /* printf is deliberately post-endpoint.  The reported reduction_ms is
-     * the in-Core wall interval covering summary allocation, the one-block
-     * reduction, D2H, validation/decision, and release. */
-    if (stats->row_gate_used)
-        std::printf(
-            "ROW_GATE_FEATURES version=exact-row-ptr-v1 "
-            "source=exact-output-row-ptr-pre-numeric oracle=0 "
-            "core_included=1 timing=end-to-end-reduction-d2h-dispatch "
-            "rows=%d workers=%d exact_c_tiles=%llu load_sum=%llu "
-            "load_sum_sq=%.17g load_max=%llu zero_workers=%d "
-            "static_max_over_mean=%.17g static_cv=%.17g "
-            "threshold=%.17g reduction_ms=%.6f valid=%d "
-            "decision=%s selected_layout=%s queue_batch=%d "
-            "cta_internal_semantics=unchanged\n",
-            stats->row_gate_rows, stats->row_gate_workers,
-            stats->row_gate_exact_tiles, stats->row_gate_load_sum,
-            stats->row_gate_load_sum_sq, stats->row_gate_load_max,
-            stats->row_gate_zero_workers,
-            stats->row_gate_static_max_over_mean,
-            stats->row_gate_static_cv, stats->row_gate_threshold,
-            stats->row_gate_reduction_ms,
-            stats->row_gate_valid ? 1 : 0,
-            stats->row_gate_decision_dynamic ? "row-dynamic"
-                                             : "tile-dynamic",
-            dmma_direct_numeric_layout_name(
-                stats->direct_numeric_layout),
-            stats->row_dynamic_queue_batch);
     if (stats->cost_balanced_requested)
         std::printf(
             "DMMA_COST_BALANCE requested=1 used=%d model=hybrid-format-v1 "
@@ -11006,96 +10251,6 @@ numeric_phase:
             stats->cost_balanced_used ? 1 : 0,
             stats->cost_worker_blocks, stats->cost_metadata_bytes,
             stats->scheduler_ms);
-
-    /* These D2H audits are deliberately after both the native-output Core
-     * endpoint and numeric_ms.  Placement establishes whether static and
-     * dynamic samples used the same strict one-worker-per-SM shape; the
-     * dynamic head additionally proves R successful plus P terminal claims. */
-    if (row_worker_requested && row_worker_count > 0)
-    {
-        std::vector<uint32_t> worker_sms(
-            static_cast<std::size_t>(row_worker_count));
-        if (!dmma_cuda_ok(cudaMemcpy(
-                              worker_sms.data(),
-                              d_row_worker_sm_ids,
-                              worker_sms.size() * sizeof(worker_sms[0]),
-                              cudaMemcpyDeviceToHost),
-                          "copy row-worker SM IDs"))
-            goto numeric_failure;
-        bool ids_valid = true;
-        for (uint32_t sm : worker_sms)
-            ids_valid = ids_valid &&
-                        sm < static_cast<uint32_t>(
-                                 row_worker_device_sm_count);
-        std::sort(worker_sms.begin(), worker_sms.end());
-        const int unique_sms = static_cast<int>(
-            std::unique(worker_sms.begin(), worker_sms.end()) -
-            worker_sms.begin());
-        const bool mapping_valid =
-            ids_valid && unique_sms == row_worker_count;
-        if (row_static_requested)
-        {
-            stats->row_static_unique_sms = unique_sms;
-            stats->row_static_mapping_valid = mapping_valid;
-            std::printf(
-                "DMMA_ROW_STATIC layout=row-static-block "
-                "partition=contiguous-equal-row-count cyclic_smoothing=0 "
-                "used=1 ctas=%d "
-                "unique_sms=%d mapping_valid=%d no_queue=1 no_steal=1 "
-                "audit_setup_untimed=1 control_head_setup_untimed=1 "
-                "control_head_unused=1 smid_stores_per_cta=1 "
-                "mapping_audit_core_excluded=1\n",
-                row_worker_count, unique_sms,
-                stats->row_static_mapping_valid ? 1 : 0);
-        }
-        else
-        {
-            int final_head = -1;
-            if (!dmma_cuda_ok(cudaMemcpy(
-                                  &final_head, d_row_dynamic_next_row,
-                                  sizeof(final_head), cudaMemcpyDeviceToHost),
-                              "copy row-dynamic queue final head"))
-                goto numeric_failure;
-            const int batch = schedule.row_queue_batch;
-            const int atomic_claims =
-                final_head >= 0 && final_head % batch == 0
-                    ? final_head / batch
-                    : -1;
-            const int expected_claims =
-                dmma_row_dynamic_expected_atomic_claims(
-                    a.tile_row_count, row_worker_count, batch);
-            const int expected_final_head =
-                dmma_row_dynamic_expected_final_head(
-                    a.tile_row_count, row_worker_count, batch);
-            stats->row_dynamic_unique_sms = unique_sms;
-            stats->row_dynamic_mapping_valid = mapping_valid;
-            stats->row_dynamic_claims = atomic_claims;
-            stats->row_dynamic_final_head = final_head;
-            stats->row_dynamic_expected_claims = expected_claims;
-            stats->row_dynamic_expected_final_head = expected_final_head;
-            stats->row_dynamic_claims_valid =
-                expected_claims >= 0 && expected_final_head >= 0 &&
-                atomic_claims == expected_claims &&
-                final_head == expected_final_head;
-            std::printf(
-                "DMMA_ROW_DYNAMIC layout=row-dynamic "
-                "partition=atomic-next-row-batch used=1 ctas=%d "
-                "unique_sms=%d mapping_valid=%d batch=%d "
-                "atomic_claims=%d expected_atomic_claims=%d "
-                "final_head=%d expected_final_head=%d "
-                "claims_valid=%d cost_model=0 row_sort=0 heavy_split=0 "
-                "reuse=0 last_batch_clipped=1 "
-                "atomic_formula=ceil_rows_over_batch_plus_ctas "
-                "head_formula=batch_times_atomic_claims "
-                "queue_setup_untimed=1 smid_stores_per_cta=1 "
-                "mapping_and_claim_audit_core_excluded=1\n",
-                row_worker_count, unique_sms,
-                stats->row_dynamic_mapping_valid ? 1 : 0, batch,
-                atomic_claims, expected_claims, final_head,
-                expected_final_head,
-                stats->row_dynamic_claims_valid ? 1 : 0);
-        }
-    }
 
     /* Admission event queries are diagnostics and therefore occur only after
      * the native-output Core endpoint.  Their recorded filter/count kernels
@@ -11344,18 +10499,28 @@ numeric_phase:
     cudaFree(d_chunk_descriptors);
     cudaFree(d_partial_workspace);
     cudaFree(d_chunk_sm_ids);
-    cudaFree(d_row_worker_sm_ids);
-    cudaFree(d_row_dynamic_next_row);
-    cudaFree(d_row_gate_summary);
     cudaFree(d_cost_sort_keys);
     cudaFree(d_cost_task_order);
     cudaFree(d_cost_queue_head);
     cudaFree(d_persistent_queue_head);
     cudaFree(d_suffix_bulk_head);
     cudaFree(d_suffix_fine_head);
-    cudaFree(d_output_tile_row_ptr);
-    cudaFree(d_output_value_cols);
-    cudaFree(d_output_values);
+    if (schedule.tileflex16_symbolic)
+    {
+        rtt::super16::DeviceBuffer<unsigned char>::recycle(
+            d_output_tile_row_ptr,
+            static_cast<std::uint64_t>(output_tile_count) * DMMA_TILE_M);
+        rtt::super16::DeviceBuffer<unsigned char>::recycle(
+            d_output_value_cols, static_cast<std::uint64_t>(output_nnz));
+        rtt::super16::DeviceBuffer<MAT_VAL_TYPE>::recycle(
+            d_output_values, static_cast<std::uint64_t>(output_nnz));
+    }
+    else
+    {
+        cudaFree(d_output_tile_row_ptr);
+        cudaFree(d_output_value_cols);
+        cudaFree(d_output_values);
+    }
     cudaFree(d_candidate_masks);
     cudaFree(d_candidate_nnz);
     cudaFree(d_candidate_keep);
@@ -11368,13 +10533,34 @@ numeric_phase:
     cudaFree(d_tail_append_state);
     cudaFree(d_symbolic_load_summary);
     cudaFree(d_unified_replay_summary);
-    cudaFree(d_output_rows);
-    cudaFree(d_output_cols);
-    cudaFree(d_output_masks);
-    cudaFree(d_output_nnz);
-    cudaFree(d_output_row_ptr);
-    cudaFree(d_output_numeric_work);
-    cudaFree(d_c16_parent_task_ids);
+    if (schedule.tileflex16_symbolic)
+    {
+        rtt::super16::DeviceBuffer<int>::recycle(
+            d_output_rows, static_cast<std::uint64_t>(output_tile_count));
+        rtt::super16::DeviceBuffer<int>::recycle(
+            d_output_cols, static_cast<std::uint64_t>(output_tile_count));
+        rtt::super16::DeviceBuffer<std::uint64_t>::recycle(
+            d_output_masks, static_cast<std::uint64_t>(output_tile_count));
+        rtt::super16::DeviceBuffer<int>::recycle(
+            d_output_nnz, static_cast<std::uint64_t>(output_tile_count) + 1);
+        rtt::super16::DeviceBuffer<int>::recycle(
+            d_output_row_ptr, static_cast<std::uint64_t>(a.tile_row_count) + 1);
+        rtt::super16::DeviceBuffer<std::uint64_t>::recycle(
+            d_output_numeric_work, static_cast<std::uint64_t>(output_tile_count));
+        rtt::super16::DeviceBuffer<int>::recycle(
+            d_c16_parent_task_ids,
+            static_cast<std::uint64_t>(c16_parent_task_count) * 4);
+    }
+    else
+    {
+        cudaFree(d_output_rows);
+        cudaFree(d_output_cols);
+        cudaFree(d_output_masks);
+        cudaFree(d_output_nnz);
+        cudaFree(d_output_row_ptr);
+        cudaFree(d_output_numeric_work);
+        cudaFree(d_c16_parent_task_ids);
+    }
     cudaFree(d_candidate_row_ptr);
     cudaFree(d_candidate_rows);
     cudaFree(d_candidate_cols);
@@ -11407,7 +10593,6 @@ numeric_failure:
     cudaFree(d_chunk_descriptors);
     cudaFree(d_partial_workspace);
     cudaFree(d_chunk_sm_ids);
-    cudaFree(d_row_gate_summary);
     cudaFree(d_persistent_queue_head);
     cudaFree(d_suffix_bulk_head);
     cudaFree(d_suffix_fine_head);
@@ -11446,9 +10631,6 @@ symbolic_cleanup:
     cudaFree(d_output_numeric_work);
     cudaFree(d_c16_parent_task_ids);
 failure:
-    cudaFree(d_row_worker_sm_ids);
-    cudaFree(d_row_dynamic_next_row);
-    cudaFree(d_row_gate_summary);
     cudaFree(d_cost_sort_keys);
     cudaFree(d_cost_task_order);
     cudaFree(d_cost_queue_head);
