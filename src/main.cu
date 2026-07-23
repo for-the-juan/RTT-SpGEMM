@@ -1367,18 +1367,34 @@ static const char *b_update_mode_name(BUpdateMode mode)
     return mode == B_UPDATE_PERMUTATION ? "permutation" : "structure";
 }
 
+static bool b_update_uses_online_value_scatter(BUpdateMode mode)
+{
+    return mode == B_UPDATE_NONE || mode == B_UPDATE_VALUES;
+}
+
+static const char *b_update_semantics_name(BUpdateMode mode)
+{
+    if (mode == B_UPDATE_NONE)
+        return "unchanged-values-online-permutation";
+    if (mode == B_UPDATE_VALUES)
+        return "changed-values-online-permutation";
+    return mode == B_UPDATE_PERMUTATION ? "permutation-rebuild"
+                                        : "structure-rebuild";
+}
+
 static void print_b_values_clear_marker(
     const char *phase, int iteration, const Options &options,
     const DmmaDynamicB &matrix, const DmmaBValuesClearDecision &decision)
 {
-    const bool values_only = options.b_update == B_UPDATE_VALUES;
-    const bool no_update = options.b_update == B_UPDATE_NONE;
+    const bool values_only =
+        b_update_uses_online_value_scatter(options.b_update);
     const std::size_t payload_bytes =
         static_cast<std::size_t>(matrix.tiles.view.payload_size) *
         sizeof(MAT_VAL_TYPE);
     std::printf(
         "B_VALUES_CLEAR phase=%s iteration=%d requested=%s "
-        "effective=%s values_only=%d clear_executed=%d "
+        "effective=%s values_only=%d online_value_scatter=%d "
+        "logical_values_changed=%d clear_executed=%d "
         "clear_skipped=%d fallback=%d reason=%s payload_bytes=%zu "
         "active_entries=%d active_duplicates=%d "
         "active_mapping_complete=%d active_mapping_injective=%d "
@@ -1387,11 +1403,11 @@ static void print_b_values_clear_marker(
         "source_aliases_a=%d structure_legacy_rebuild=%d\n",
         phase, iteration,
         dmma_b_values_clear_policy_name(options.b_values_clear_policy),
-        no_update ? "none-static-AA"
-                  : (values_only
-                         ? (decision.skip_clear ? "noclear" : "clear")
-                         : "structure-rebuild"),
+        values_only ? (decision.skip_clear ? "noclear" : "clear")
+                    : "structure-rebuild",
         values_only ? 1 : 0,
+        values_only ? 1 : 0,
+        options.b_update == B_UPDATE_VALUES ? 1 : 0,
         values_only && decision.clear_payload && payload_bytes > 0 ? 1 : 0,
         values_only && decision.skip_clear ? 1 : 0,
         decision.fallback ? 1 : 0,
@@ -1624,11 +1640,16 @@ int main(int argc, char **argv)
     std::printf(
         "B_VALUES_CLEAR_CONFIG requested=%s default=always-clear "
         "default_off=1 legacy_entrypoint_unchanged=1 "
-        "eligibility=values-only+valid+no-active-duplicates+"
+        "eligibility=online-value-scatter+valid+no-active-duplicates+"
         "complete-injective-active-map+initialized-payload+sparse-only+"
         "read-only-numeric "
         "unsafe_action=clear-fallback timing_boundary=unchanged\n",
         dmma_b_values_clear_policy_name(options.b_values_clear_policy));
+    std::printf(
+        "B_UPDATE_CONTRACT mode=%s semantics=%s scatter_inside_core=%d\n",
+        b_update_mode_name(options.b_update),
+        b_update_semantics_name(options.b_update),
+        b_update_uses_online_value_scatter(options.b_update) ? 1 : 0);
     std::printf("NUMERIC_SCHEDULE mode=%s direct_layout=%s "
                 "reduction=%s launch_policy=%s "
                 "light_policy=%s critical_q_min=%.9f "
@@ -1757,7 +1778,7 @@ int main(int argc, char **argv)
                 b_update_mode_name(options.b_update),
                 options.b_update != B_UPDATE_STRUCTURE ? 1 : 0,
                 options.b_update == B_UPDATE_NONE
-                    ? "static-AA-no-update"
+                    ? "unchanged-values-online-permutation"
                     : (options.b_update == B_UPDATE_VALUES
                            ? "matched-online-values-contract"
                            : "cusparse-controls-do-not-rebuild-structure"));
@@ -2038,7 +2059,7 @@ int main(int argc, char **argv)
         schedule_config.super16_b = dynamic_b.super16.view();
     }
 
-    if (options.b_update == B_UPDATE_VALUES)
+    if (b_update_uses_online_value_scatter(options.b_update))
     {
         release_dynamic_b_rebuild_workspace(&dynamic_b);
         release_dmma_reorder_device_maps(&prepared_a.reorder);
@@ -2120,7 +2141,8 @@ int main(int argc, char **argv)
         DmmaBValuesClearDecision update_clear_decision =
             dmma_choose_b_values_clear(
                 options.b_values_clear_policy,
-                options.b_update == B_UPDATE_VALUES, dynamic_b.valid,
+                b_update_uses_online_value_scatter(options.b_update),
+                dynamic_b.valid,
                 dynamic_b.has_duplicates,
                 dynamic_b.active_source_mapping_complete,
                 dynamic_b.active_source_to_payload_injective,
@@ -2131,12 +2153,8 @@ int main(int argc, char **argv)
             goto cleanup;
         const std::chrono::steady_clock::time_point core_begin =
             std::chrono::steady_clock::now();
-        if (options.b_update == B_UPDATE_NONE)
-        {
-            update_ok = true;
-        }
-        else if (options.b_update == B_UPDATE_STRUCTURE ||
-                 options.b_update == B_UPDATE_PERMUTATION)
+        if (options.b_update == B_UPDATE_STRUCTURE ||
+            options.b_update == B_UPDATE_PERMUTATION)
         {
             update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
                                   &update_stats);
@@ -2220,7 +2238,8 @@ int main(int argc, char **argv)
         DmmaBValuesClearDecision update_clear_decision =
             dmma_choose_b_values_clear(
                 options.b_values_clear_policy,
-                options.b_update == B_UPDATE_VALUES, dynamic_b.valid,
+                b_update_uses_online_value_scatter(options.b_update),
+                dynamic_b.valid,
                 dynamic_b.has_duplicates,
                 dynamic_b.active_source_mapping_complete,
                 dynamic_b.active_source_to_payload_injective,
@@ -2231,12 +2250,8 @@ int main(int argc, char **argv)
             goto cleanup;
         const std::chrono::steady_clock::time_point core_begin =
             std::chrono::steady_clock::now();
-        if (options.b_update == B_UPDATE_NONE)
-        {
-            update_ok = true;
-        }
-        else if (options.b_update == B_UPDATE_STRUCTURE ||
-                 options.b_update == B_UPDATE_PERMUTATION)
+        if (options.b_update == B_UPDATE_STRUCTURE ||
+            options.b_update == B_UPDATE_PERMUTATION)
         {
             update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
                                   &update_stats);
@@ -2304,7 +2319,7 @@ int main(int argc, char **argv)
         const double tile_compatible_dmma_ms = dmma_stats.total_ms;
         print_b_values_clear_marker("timed", iteration + 1, options,
                                     dynamic_b, update_clear_decision);
-        if (options.b_update == B_UPDATE_VALUES)
+        if (b_update_uses_online_value_scatter(options.b_update))
         {
             if (update_clear_decision.skip_clear)
                 ++b_values_noclear_timed_samples;
@@ -2388,10 +2403,7 @@ int main(int argc, char **argv)
 
         std::printf("---------------- iteration %d/%d ----------------\n",
                     iteration + 1, options.iterations);
-        if (options.b_update == B_UPDATE_NONE)
-            std::printf("Iteration B update: none (static A*A)\n");
-        else
-            print_b_update_stats("Iteration", update_stats);
+        print_b_update_stats("Iteration", update_stats);
         std::printf("candidate C tiles=%llu; exact non-empty C tiles=%d; "
                     "nnzC=%d\n",
                     dmma_stats.candidate_tiles, dmma_stats.output_tiles,
@@ -2832,7 +2844,9 @@ int main(int argc, char **argv)
         "legacy_always_clear_entrypoint=%d timing_boundary=unchanged\n",
         dmma_b_values_clear_policy_name(options.b_values_clear_policy),
         b_update_mode_name(options.b_update),
-        options.b_update == B_UPDATE_VALUES ? options.iterations : 0,
+        b_update_uses_online_value_scatter(options.b_update)
+            ? options.iterations
+            : 0,
         b_values_clear_timed_samples, b_values_noclear_timed_samples,
         b_values_clear_fallback_timed_samples,
         options.b_values_clear_policy == DMMA_B_VALUES_ALWAYS_CLEAR ? 1 : 0);
