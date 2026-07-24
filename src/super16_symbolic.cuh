@@ -522,13 +522,6 @@ struct LeafRecord
     std::uint8_t padding[3];
 };
 
-struct ParentCscRecord
-{
-    std::uint64_t key;
-    std::uint32_t parent_id;
-    std::uint32_t padding;
-};
-
 struct LeafRecordLess
 {
     __host__ __device__ bool operator()(const LeafRecord &left,
@@ -539,17 +532,6 @@ struct LeafRecordLess
                 (left.slot < right.slot ||
                  (left.slot == right.slot &&
                   left.leaf_id < right.leaf_id)));
-    }
-};
-
-struct ParentCscRecordLess
-{
-    __host__ __device__ bool operator()(const ParentCscRecord &left,
-                                        const ParentCscRecord &right) const
-    {
-        return left.key < right.key ||
-               (left.key == right.key &&
-                left.parent_id < right.parent_id);
     }
 };
 
@@ -881,9 +863,10 @@ __global__ void build_parent_boolean_rows_kernel(
     }
 }
 
-__global__ void make_parent_csc_records_kernel(
+__global__ void make_parent_csc_keys_kernel(
     std::uint32_t parent_row_count, const std::uint64_t *parent_row_ptr,
-    const std::uint32_t *parent_col_idx, ParentCscRecord *records)
+    const std::uint32_t *parent_col_idx, std::uint64_t *keys,
+    std::uint32_t *parent_ids)
 {
     const std::uint64_t stride =
         static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
@@ -894,19 +877,18 @@ __global__ void make_parent_csc_records_kernel(
         for (std::uint64_t id = parent_row_ptr[row];
              id < parent_row_ptr[row + 1]; ++id)
         {
-            ParentCscRecord record{};
-            record.key =
+            keys[id] =
                 static_cast<std::uint64_t>(parent_col_idx[id]) *
                     parent_row_count +
                 row;
-            record.parent_id = static_cast<std::uint32_t>(id);
-            records[id] = record;
+            parent_ids[id] = static_cast<std::uint32_t>(id);
         }
     }
 }
 
 __global__ void fill_parent_csc_kernel(
-    const ParentCscRecord *records, std::uint32_t parent_count,
+    const std::uint64_t *keys, const std::uint32_t *parent_ids,
+    std::uint32_t parent_count,
     std::uint32_t parent_row_count, std::uint64_t *parent_col_ptr,
     std::uint32_t *parent_row_idx, std::uint32_t *csc_parent_ids,
     int *error)
@@ -917,23 +899,23 @@ __global__ void fill_parent_csc_kernel(
              static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          position < parent_count; position += stride)
     {
-        const ParentCscRecord record = records[position];
+        const std::uint64_t key = keys[position];
         const std::uint32_t col =
-            static_cast<std::uint32_t>(record.key / parent_row_count);
+            static_cast<std::uint32_t>(key / parent_row_count);
         const std::uint32_t row =
-            static_cast<std::uint32_t>(record.key % parent_row_count);
+            static_cast<std::uint32_t>(key % parent_row_count);
         if (position > 0)
         {
-            const ParentCscRecord prior = records[position - 1];
+            const std::uint64_t prior = keys[position - 1];
             const std::uint32_t prior_col =
-                static_cast<std::uint32_t>(prior.key / parent_row_count);
+                static_cast<std::uint32_t>(prior / parent_row_count);
             const std::uint32_t prior_row =
-                static_cast<std::uint32_t>(prior.key % parent_row_count);
+                static_cast<std::uint32_t>(prior % parent_row_count);
             if (prior_col == col && prior_row >= row)
                 atomicCAS(error, 0, 6);
         }
         parent_row_idx[position] = row;
-        csc_parent_ids[position] = record.parent_id;
+        csc_parent_ids[position] = parent_ids[position];
         atomicAdd(reinterpret_cast<unsigned long long *>(parent_col_ptr + col + 1),
                   1ull);
     }
@@ -2188,25 +2170,8 @@ inline bool build_device_index(const DmmaDeviceTiles &leaf, OperandRole role,
         !detail::cuda_ok(cudaMemsetAsync(error.get(), 0, sizeof(int), stream),
                          "clear Super16 error flag"))
         return false;
-    const std::uint64_t parent_capacity =
-        static_cast<std::uint64_t>(leaf.num_tiles);
-    /* Allocate the direct builder's upper-bound arena before launching any
-     * count/scan work.  cudaMalloc between count and fill is synchronizing
-     * and previously serialized the whole stream several times. */
     if (!result.row_ptr_.allocate(static_cast<std::uint64_t>(parent_rows) + 1,
                                   "allocate Super16 parent row pointer") ||
-        !result.col_idx_.allocate(parent_capacity,
-                                  "allocate direct Super16 parent columns") ||
-        !result.child_ptr_.allocate(parent_capacity + 1,
-                                    "allocate direct Super16 child pointer") ||
-        !result.child_mask_.allocate(parent_capacity,
-                                     "allocate direct Super16 child masks") ||
-        !result.child_leaf_ids_.allocate(
-            static_cast<std::uint64_t>(leaf.num_tiles),
-            "allocate direct Super16 child leaf IDs") ||
-        !result.boolean_row_masks_.allocate(
-            parent_capacity * 16,
-            "allocate direct Super16 parent Boolean rows") ||
         !detail::cuda_ok(cudaMemsetAsync(
                              result.row_ptr_.get(), 0,
                              (static_cast<std::size_t>(parent_rows) + 1) *
@@ -2248,6 +2213,21 @@ inline bool build_device_index(const DmmaDeviceTiles &leaf, OperandRole role,
     const std::uint32_t parent_count =
         static_cast<std::uint32_t>(parent_count64);
     result.metadata_.parent_count = parent_count;
+    const std::uint64_t parent_capacity =
+        static_cast<std::uint64_t>(parent_count);
+    if (!result.col_idx_.allocate(parent_capacity,
+                                  "allocate exact Super16 parent columns") ||
+        !result.child_ptr_.allocate(parent_capacity + 1,
+                                    "allocate exact Super16 child pointer") ||
+        !result.child_mask_.allocate(parent_capacity,
+                                     "allocate exact Super16 child masks") ||
+        !result.child_leaf_ids_.allocate(
+            static_cast<std::uint64_t>(leaf.num_tiles),
+            "allocate Super16 child leaf IDs") ||
+        !result.boolean_row_masks_.allocate(
+            parent_capacity * 16,
+            "allocate exact Super16 parent Boolean rows"))
+        return false;
     if (parent_row_blocks > 0)
         detail::fill_parent_view_from_leaf_csr_kernel
             <<<parent_row_blocks, kBuildThreads, 0, stream>>>(
@@ -2271,9 +2251,9 @@ inline bool build_device_index(const DmmaDeviceTiles &leaf, OperandRole role,
 
     if (role == OperandRole::B4x8)
     {
-        DeviceBuffer<detail::ParentCscRecord> csc_records;
-        if (!csc_records.allocate(parent_count,
-                                  "allocate Super16 B CSC records") ||
+        DeviceBuffer<std::uint64_t> csc_keys;
+        if (!csc_keys.allocate(parent_count,
+                               "allocate Super16 B CSC keys") ||
             !result.col_ptr_.allocate(static_cast<std::uint64_t>(parent_cols) + 1,
                                       "allocate Super16 B parent col pointer") ||
             !result.row_idx_.allocate(parent_count,
@@ -2289,17 +2269,17 @@ inline bool build_device_index(const DmmaDeviceTiles &leaf, OperandRole role,
             return false;
         if (parent_count > 0)
         {
-            detail::make_parent_csc_records_kernel
+            detail::make_parent_csc_keys_kernel
                 <<<detail::build_blocks(parent_rows), kBuildThreads, 0, stream>>>(
                     parent_rows, result.row_ptr_.get(), result.col_idx_.get(),
-                    csc_records.get());
+                    csc_keys.get(), result.csc_parent_ids_.get());
             try
             {
                 auto policy = thrust::cuda::par.on(stream);
-                thrust::device_ptr<detail::ParentCscRecord> ptr(
-                    csc_records.get());
-                thrust::sort(policy, ptr, ptr + parent_count,
-                             detail::ParentCscRecordLess{});
+                thrust::device_ptr<std::uint64_t> keys(csc_keys.get());
+                thrust::device_ptr<std::uint32_t> ids(
+                    result.csc_parent_ids_.get());
+                thrust::sort_by_key(policy, keys, keys + parent_count, ids);
             }
             catch (const std::exception &exception)
             {
@@ -2311,7 +2291,8 @@ inline bool build_device_index(const DmmaDeviceTiles &leaf, OperandRole role,
             }
             detail::fill_parent_csc_kernel
                 <<<detail::build_blocks(parent_count), kBuildThreads, 0, stream>>>(
-                    csc_records.get(), parent_count, parent_rows,
+                    csc_keys.get(), result.csc_parent_ids_.get(),
+                    parent_count, parent_rows,
                     result.col_ptr_.get(), result.row_idx_.get(),
                     result.csc_parent_ids_.get(), error.get());
             if (!detail::cuda_ok(cudaGetLastError(),

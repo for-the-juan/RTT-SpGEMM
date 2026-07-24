@@ -3,7 +3,6 @@
 
 #include "dmma_spgemm.h"
 #include "dmma_reorder.h"
-#include "dmma_b_values_clear_policy.h"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -65,51 +64,49 @@ static inline DmmaDeviceCsrView device_csr_view(
 
 struct DmmaBUpdateStats
 {
+    double csr_row_permute_ms = 0.0;
     double validation_ms = 0.0;
     double key_sort_reduce_ms = 0.0;
     double tile_build_ms = 0.0;
+    double ordered_count_ms = 0.0;
+    double ordered_pack_ms = 0.0;
+    double ordered_layout_ms = 0.0;
+    double ordered_payload_alloc_ms = 0.0;
+    double ordered_payload_fill_ms = 0.0;
     double csc_ms = 0.0;
     double mapping_ms = 0.0;
     double low_fill_metadata_ms = 0.0;
     double super16_build_ms = 0.0;
-    double value_update_ms = 0.0;
     double total_ms = 0.0;
     std::size_t peak_workspace_bytes = 0;
     int source_entries = 0;
     int active_entries = 0;
     int unique_entries = 0;
     bool structure_rebuilt = false;
+    bool ordered_csr_fallback = false;
+    bool fused_csr_row_permute = false;
 };
 
-/* Grow-only scratch used by repeated B structure updates.  Resizing a
- * device_vector within its capacity does not allocate, so the common
- * fixed-or-shrinking topology case keeps the sort/mapping workspace alive. */
+/* Grow-only scratch used by repeated B format rebuilds.  Resizing a
+ * device_vector within its capacity does not allocate. */
 struct DmmaBWorkspace
 {
     thrust::device_vector<unsigned long long> entry_keys;
     thrust::device_vector<MAT_VAL_TYPE> entry_values;
-    thrust::device_vector<int> source_ids;
-    thrust::device_vector<int> unique_ids;
-    thrust::device_vector<int> head_flags;
 };
 
 struct DmmaDynamicB
 {
     DmmaOwnedDeviceTiles tiles;
     rtt::super16::OwnedDeviceIndex super16;
-    int *source_to_payload = nullptr;
     int source_nnz = 0;
-    int source_capacity = 0;
     int source_rows = 0;
     int source_cols = 0;
     int active_rows = 0;
     int active_entries = 0;
     bool has_duplicates = false;
-    /* Hard eligibility facts for values-only no-clear updates.  A successful
-     * rebuild sets both only after pack and source-map construction finish. */
-    bool active_source_mapping_complete = false;
-    bool active_source_to_payload_injective = false;
     bool payload_fully_initialized = false;
+    bool fused_csr_row_permute = false;
     bool valid = false;
     DmmaBWorkspace workspace;
 };
@@ -174,18 +171,7 @@ static inline void destroy_dynamic_b(DmmaDynamicB *matrix)
     if (matrix == nullptr)
         return;
     destroy_device_tiles(&matrix->tiles);
-    cudaFree(matrix->source_to_payload);
     *matrix = DmmaDynamicB();
-}
-
-/* Values-only iterations need only the persistent source-to-payload map.
- * Release the sort/reduce scratch after the initial structure build so very
- * large B inputs do not pin O(nnz) temporary storage throughout SpGEMM. */
-static inline void release_dynamic_b_rebuild_workspace(DmmaDynamicB *matrix)
-{
-    if (matrix == nullptr)
-        return;
-    matrix->workspace = DmmaBWorkspace();
 }
 
 static inline void destroy_prepared_a(DmmaPreparedA *prepared)
@@ -268,6 +254,328 @@ __global__ void validate_csr_kernel(const int *row_ptr, const int *col_idx,
     }
 }
 
+__global__ void permute_csr_row_lengths_kernel(
+    const int *source_row_ptr, int rows, const int *row_new_to_old,
+    int *permuted_row_ptr, int *error)
+{
+    const int new_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (new_row >= rows)
+        return;
+    const int old_row =
+        row_new_to_old != nullptr ? row_new_to_old[new_row] : new_row;
+    if (old_row < 0 || old_row >= rows)
+    {
+        atomicExch(error, 1);
+        return;
+    }
+    permuted_row_ptr[new_row + 1] =
+        source_row_ptr[old_row + 1] - source_row_ptr[old_row];
+}
+
+__global__ void copy_permuted_csr_rows_kernel(
+    const int *source_row_ptr, const int *source_col_idx,
+    const MAT_VAL_TYPE *source_values, int rows,
+    const int *row_new_to_old, const int *permuted_row_ptr,
+    int *permuted_col_idx, MAT_VAL_TYPE *permuted_values, int *error)
+{
+    const int new_row = blockIdx.x;
+    if (new_row >= rows)
+        return;
+    const int old_row =
+        row_new_to_old != nullptr ? row_new_to_old[new_row] : new_row;
+    if (old_row < 0 || old_row >= rows)
+    {
+        if (threadIdx.x == 0)
+            atomicExch(error, 1);
+        return;
+    }
+    const int source_begin = source_row_ptr[old_row];
+    const int source_end = source_row_ptr[old_row + 1];
+    const int destination_begin = permuted_row_ptr[new_row];
+    for (int offset = threadIdx.x; offset < source_end - source_begin;
+         offset += blockDim.x)
+    {
+        permuted_col_idx[destination_begin + offset] =
+            source_col_idx[source_begin + offset];
+        permuted_values[destination_begin + offset] =
+            source_values[source_begin + offset];
+    }
+}
+
+__device__ __forceinline__ int dmma_warp_min_int(int value)
+{
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        value = min(value, __shfl_down_sync(0xffffffffu, value, offset));
+    return __shfl_sync(0xffffffffu, value, 0);
+}
+
+__global__ void count_ordered_b_tile_rows_warp_kernel(
+    const int *row_ptr, const int *col_idx, int source_rows,
+    const int *row_new_to_old, int active_rows, int *tile_row_ptr,
+    unsigned long long *active_entry_count, int *error)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int tile_row = blockIdx.x * warps_per_block + warp_in_block;
+    const int tile_row_count =
+        (active_rows + DMMA_TILE_K - 1) / DMMA_TILE_K;
+    if (tile_row >= tile_row_count)
+        return;
+
+    const int new_row = tile_row * DMMA_TILE_K + lane;
+    bool owns_row = lane < DMMA_TILE_K && new_row < active_rows;
+    int row = owns_row && row_new_to_old != nullptr
+                  ? row_new_to_old[new_row]
+                  : new_row;
+    if (owns_row && (row < 0 || row >= source_rows))
+    {
+        atomicExch(error, 2);
+        owns_row = false;
+    }
+    int cursor = owns_row ? row_ptr[row] : 0;
+    const int end = owns_row ? row_ptr[row + 1] : 0;
+    if (owns_row)
+        atomicAdd(active_entry_count,
+                  static_cast<unsigned long long>(end - cursor));
+    int current_tile =
+        cursor < end ? col_idx[cursor] / DMMA_TILE_N : 0x7fffffff;
+    int tile_count = 0;
+    while (true)
+    {
+        const int next_tile = dmma_warp_min_int(current_tile);
+        if (next_tile == 0x7fffffff)
+            break;
+        if (owns_row && current_tile == next_tile)
+        {
+            do
+            {
+                if (cursor > row_ptr[row] &&
+                    col_idx[cursor] < col_idx[cursor - 1])
+                    atomicExch(error, 1);
+                ++cursor;
+            } while (cursor < end &&
+                     col_idx[cursor] / DMMA_TILE_N == next_tile);
+            current_tile =
+                cursor < end ? col_idx[cursor] / DMMA_TILE_N : 0x7fffffff;
+        }
+        if (lane == 0)
+            ++tile_count;
+    }
+    if (lane == 0)
+        tile_row_ptr[tile_row + 1] = tile_count;
+}
+
+__global__ void fill_ordered_b_tile_metadata_warp_kernel(
+    const int *row_ptr, const int *col_idx, int active_rows,
+    const int *row_new_to_old, int tile_col_count,
+    const int *tile_row_ptr, int *tile_col_idx, int *tile_entry_counts,
+    EntryKey *tile_keys, uint32_t *masks, int *error)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int tile_row = blockIdx.x * warps_per_block + warp_in_block;
+    const int tile_row_count =
+        (active_rows + DMMA_TILE_K - 1) / DMMA_TILE_K;
+    if (tile_row >= tile_row_count)
+        return;
+
+    const int new_row = tile_row * DMMA_TILE_K + lane;
+    const bool owns_row = lane < DMMA_TILE_K && new_row < active_rows;
+    const int row = owns_row && row_new_to_old != nullptr
+                        ? row_new_to_old[new_row]
+                        : new_row;
+    int cursor = owns_row ? row_ptr[row] : 0;
+    const int end = owns_row ? row_ptr[row + 1] : 0;
+    int current_tile =
+        cursor < end ? col_idx[cursor] / DMMA_TILE_N : 0x7fffffff;
+    int output_tile = tile_row_ptr[tile_row];
+    while (true)
+    {
+        const int next_tile = dmma_warp_min_int(current_tile);
+        if (next_tile == 0x7fffffff)
+            break;
+
+        uint32_t lane_mask = 0;
+        if (owns_row && current_tile == next_tile)
+        {
+            do
+            {
+                const int local_col = col_idx[cursor] % DMMA_TILE_N;
+                lane_mask |= uint32_t(1) <<
+                             (local_col * DMMA_TILE_K + lane);
+                ++cursor;
+            } while (cursor < end &&
+                     col_idx[cursor] / DMMA_TILE_N == next_tile);
+            current_tile =
+                cursor < end ? col_idx[cursor] / DMMA_TILE_N : 0x7fffffff;
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            lane_mask |=
+                __shfl_down_sync(0xffffffffu, lane_mask, offset);
+        if (lane == 0)
+        {
+            if (output_tile >= tile_row_ptr[tile_row + 1] ||
+                next_tile < 0 || next_tile >= tile_col_count)
+            {
+                atomicExch(error, 1);
+                return;
+            }
+            tile_col_idx[output_tile] = next_tile;
+            tile_entry_counts[output_tile] = __popc(lane_mask);
+            tile_keys[output_tile] =
+                static_cast<EntryKey>(tile_row) * tile_col_count +
+                next_tile;
+            masks[output_tile] = lane_mask;
+            ++output_tile;
+        }
+    }
+    if (lane == 0 && output_tile != tile_row_ptr[tile_row + 1])
+        atomicExch(error, 1);
+}
+
+__global__ void prepare_ordered_b_payload_layout_kernel(
+    const int *tile_entry_counts, int tile_count, int dense_threshold,
+    int *payload_spans, int *dense_flags)
+{
+    const int tile = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tile >= tile_count)
+        return;
+    const bool dense = tile_entry_counts[tile] >= dense_threshold;
+    payload_spans[tile] =
+        dense ? DMMA_INPUT_ELEMS : tile_entry_counts[tile];
+    dense_flags[tile] = dense ? 1 : 0;
+}
+
+__global__ void reduce_ordered_b_tile_stats_kernel(
+    const int *tile_entry_counts, const int *dense_flags,
+    const int *payload_spans, int tile_count, unsigned long long *totals)
+{
+    unsigned long long unique = 0;
+    unsigned long long dense = 0;
+    unsigned long long payload = 0;
+    for (int tile = blockIdx.x * blockDim.x + threadIdx.x;
+         tile < tile_count; tile += blockDim.x * gridDim.x)
+    {
+        unique += static_cast<unsigned long long>(tile_entry_counts[tile]);
+        dense += static_cast<unsigned long long>(dense_flags[tile]);
+        payload += static_cast<unsigned long long>(payload_spans[tile]);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        unique += __shfl_down_sync(0xffffffffu, unique, offset);
+        dense += __shfl_down_sync(0xffffffffu, dense, offset);
+        payload += __shfl_down_sync(0xffffffffu, payload, offset);
+    }
+    __shared__ unsigned long long warp_unique[8];
+    __shared__ unsigned long long warp_dense[8];
+    __shared__ unsigned long long warp_payload[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0)
+    {
+        warp_unique[warp] = unique;
+        warp_dense[warp] = dense;
+        warp_payload[warp] = payload;
+    }
+    __syncthreads();
+    if (warp == 0)
+    {
+        unique = lane < blockDim.x / 32 ? warp_unique[lane] : 0;
+        dense = lane < blockDim.x / 32 ? warp_dense[lane] : 0;
+        payload = lane < blockDim.x / 32 ? warp_payload[lane] : 0;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            unique += __shfl_down_sync(0xffffffffu, unique, offset);
+            dense += __shfl_down_sync(0xffffffffu, dense, offset);
+            payload += __shfl_down_sync(0xffffffffu, payload, offset);
+        }
+        if (lane == 0)
+        {
+            atomicAdd(totals, unique);
+            atomicAdd(totals + 1, dense);
+            atomicAdd(totals + 2, payload);
+        }
+    }
+}
+
+__global__ void fill_ordered_b_payload_warp_kernel(
+    const int *row_ptr, const int *col_idx,
+    const MAT_VAL_TYPE *source_values, int active_rows,
+    const int *row_new_to_old, int dense_threshold, const int *tile_row_ptr,
+    const int *tile_entry_counts, const int *value_offsets,
+    const uint32_t *masks, MAT_VAL_TYPE *payload, int *error)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int tile_row = blockIdx.x * warps_per_block + warp_in_block;
+    const int tile_row_count =
+        (active_rows + DMMA_TILE_K - 1) / DMMA_TILE_K;
+    if (tile_row >= tile_row_count)
+        return;
+
+    const int new_row = tile_row * DMMA_TILE_K + lane;
+    const bool owns_row = lane < DMMA_TILE_K && new_row < active_rows;
+    const int row = owns_row && row_new_to_old != nullptr
+                        ? row_new_to_old[new_row]
+                        : new_row;
+    int cursor = owns_row ? row_ptr[row] : 0;
+    const int end = owns_row ? row_ptr[row + 1] : 0;
+    int current_tile =
+        cursor < end ? col_idx[cursor] / DMMA_TILE_N : 0x7fffffff;
+    int output_tile = tile_row_ptr[tile_row];
+    while (true)
+    {
+        const int next_tile = dmma_warp_min_int(current_tile);
+        if (next_tile == 0x7fffffff)
+            break;
+        if (output_tile >= tile_row_ptr[tile_row + 1])
+        {
+            if (lane == 0)
+                atomicExch(error, 1);
+            return;
+        }
+        const bool dense =
+            tile_entry_counts[output_tile] >= dense_threshold;
+        const int output = value_offsets[output_tile];
+        if (dense)
+            payload[output + lane] = MAT_VAL_TYPE(0);
+        __syncwarp();
+
+        if (owns_row && current_tile == next_tile)
+        {
+            const uint32_t mask = masks[output_tile];
+            do
+            {
+                const int column = col_idx[cursor];
+                MAT_VAL_TYPE sum = source_values[cursor++];
+                while (cursor < end && col_idx[cursor] == column)
+                    sum += source_values[cursor++];
+                const int physical =
+                    (column % DMMA_TILE_N) * DMMA_TILE_K + lane;
+                const uint32_t lower =
+                    physical == 0
+                        ? 0
+                        : mask & ((uint32_t(1) << physical) - 1);
+                const int destination =
+                    output + (dense ? physical : __popc(lower));
+                payload[destination] = sum;
+            } while (cursor < end &&
+                     col_idx[cursor] / DMMA_TILE_N == next_tile);
+            current_tile =
+                cursor < end ? col_idx[cursor] / DMMA_TILE_N : 0x7fffffff;
+        }
+        __syncwarp();
+        ++output_tile;
+    }
+}
+
 __global__ void fill_entry_keys_kernel(
     const int *row_ptr, const int *col_idx, const MAT_VAL_TYPE *values,
     int source_rows, int logical_cols, int tile_rows, int tile_cols,
@@ -308,7 +616,7 @@ __global__ void fill_mapped_entry_keys_kernel(
     bool logical_transpose, const int *row_old_to_new,
     const int *col_old_to_new, int active_logical_rows,
     int active_logical_cols, EntryKey invalid_key, EntryKey *keys,
-    MAT_VAL_TYPE *key_values, int *source_ids)
+    MAT_VAL_TYPE *key_values)
 {
     const int source_row = blockIdx.x * blockDim.x + threadIdx.x;
     if (source_row >= source_rows)
@@ -325,8 +633,6 @@ __global__ void fill_mapped_entry_keys_kernel(
         int logical_col = col_old_to_new != nullptr
                               ? col_old_to_new[old_col]
                               : old_col;
-        if (source_ids != nullptr)
-            source_ids[entry] = entry;
         if (old_row < 0 || old_row >= logical_rows || old_col < 0 ||
             old_col >= logical_cols || logical_row < 0 || logical_col < 0 ||
             logical_row >= active_logical_rows ||
@@ -348,64 +654,6 @@ __global__ void fill_mapped_entry_keys_kernel(
         keys[entry] = tile_key * DMMA_INPUT_ELEMS + physical;
         key_values[entry] = values[entry];
     }
-}
-
-__global__ void mark_unique_entry_heads_kernel(const EntryKey *keys,
-                                                int count, int *heads)
-{
-    const int entry = blockIdx.x * blockDim.x + threadIdx.x;
-    if (entry < count)
-        heads[entry] = entry == 0 || keys[entry] != keys[entry - 1];
-}
-
-__global__ void build_unique_payload_map_kernel(
-    const EntryKey *unique_keys, const int *entry_offsets,
-    const int *entry_counts, const int *value_offsets, int tile_count,
-    int dense_threshold, int *unique_to_payload)
-{
-    const int tile = blockIdx.x;
-    if (tile >= tile_count)
-        return;
-    const int begin = entry_offsets[tile];
-    const int count = entry_counts[tile];
-    const int output = value_offsets[tile];
-    const bool dense = count >= dense_threshold;
-    for (int local = threadIdx.x; local < count; local += blockDim.x)
-    {
-        const int unique_entry = begin + local;
-        const int physical = static_cast<int>(
-            unique_keys[unique_entry] % DMMA_INPUT_ELEMS);
-        unique_to_payload[unique_entry] =
-            output + (dense ? physical : local);
-    }
-}
-
-__global__ void finish_source_payload_map_kernel(
-    int count, const int *sorted_source_ids, const int *inclusive_unique_ids,
-    const int *unique_to_payload, int *source_to_payload)
-{
-    const int sorted_entry = blockIdx.x * blockDim.x + threadIdx.x;
-    if (sorted_entry >= count)
-        return;
-    const int unique_entry = inclusive_unique_ids[sorted_entry] - 1;
-    source_to_payload[sorted_source_ids[sorted_entry]] =
-        unique_to_payload[unique_entry];
-}
-
-__global__ void update_payload_values_kernel(
-    int count, const MAT_VAL_TYPE *source_values,
-    const int *source_to_payload, bool use_atomics, MAT_VAL_TYPE *payload)
-{
-    const int source = blockIdx.x * blockDim.x + threadIdx.x;
-    if (source >= count)
-        return;
-    const int destination = source_to_payload[source];
-    if (destination < 0)
-        return;
-    if (use_atomics)
-        atomicAdd(payload + destination, source_values[source]);
-    else
-        payload[destination] = source_values[source];
 }
 
 struct EntryToTileKey
@@ -668,15 +916,101 @@ static inline bool validate_device_csr(const DmmaDeviceCsrView &view,
     return ok && host_error == 0;
 }
 
+static inline bool permute_device_csr_rows(
+    const DmmaDeviceCsrView &source, const int *row_new_to_old,
+    cudaStream_t stream, DmmaOwnedDeviceCsr *out, double *elapsed_ms)
+{
+    if (out == nullptr || source.rows < 0 || source.cols < 0 ||
+        source.nnz < 0 ||
+        (source.rows > 0 && source.row_ptr == nullptr) ||
+        (source.nnz > 0 &&
+         (source.col_idx == nullptr || source.values == nullptr)))
+        return false;
+
+    const auto begin = Clock::now();
+    DmmaOwnedDeviceCsr result;
+    result.rows = source.rows;
+    result.cols = source.cols;
+    result.nnz = source.nnz;
+    int *d_error = nullptr;
+    int h_error = 0;
+    if (!device_allocate(
+            &result.row_ptr, static_cast<std::size_t>(source.rows) + 1,
+            "allocate permuted B CSR row pointer") ||
+        !device_allocate(&result.col_idx, source.nnz,
+                         "allocate permuted B CSR columns") ||
+        !device_allocate(&result.values, source.nnz,
+                         "allocate permuted B CSR values") ||
+        !device_allocate(&d_error, 1,
+                         "allocate permuted B CSR error flag") ||
+        !dmma_cuda_ok(cudaMemsetAsync(
+            result.row_ptr, 0,
+            (static_cast<std::size_t>(source.rows) + 1) * sizeof(int),
+            stream),
+            "clear permuted B CSR row pointer") ||
+        !dmma_cuda_ok(cudaMemsetAsync(d_error, 0, sizeof(int), stream),
+                      "clear permuted B CSR error flag"))
+        goto failure;
+
+    if (source.rows > 0)
+    {
+        permute_csr_row_lengths_kernel<<<block_count(source.rows), kThreads,
+                                         0, stream>>>(
+            source.row_ptr, source.rows, row_new_to_old, result.row_ptr,
+            d_error);
+        if (!dmma_cuda_ok(cudaGetLastError(),
+                          "build permuted B CSR row lengths"))
+            goto failure;
+    }
+    {
+        auto row_ptr = thrust::device_pointer_cast(result.row_ptr);
+        thrust::inclusive_scan(
+            thrust::cuda::par.on(stream), row_ptr,
+            row_ptr + static_cast<std::size_t>(source.rows) + 1, row_ptr);
+    }
+    if (source.rows > 0)
+    {
+        copy_permuted_csr_rows_kernel<<<source.rows, kThreads, 0, stream>>>(
+            source.row_ptr, source.col_idx, source.values, source.rows,
+            row_new_to_old, result.row_ptr, result.col_idx, result.values,
+            d_error);
+        if (!dmma_cuda_ok(cudaGetLastError(),
+                          "copy permuted B CSR rows"))
+            goto failure;
+    }
+    if (!dmma_cuda_ok(cudaMemcpyAsync(
+            &h_error, d_error, sizeof(int), cudaMemcpyDeviceToHost, stream),
+            "read permuted B CSR error flag") ||
+        !dmma_cuda_ok(cudaStreamSynchronize(stream),
+                      "complete B CSR row permutation") ||
+        h_error != 0)
+        goto failure;
+
+    cudaFree(d_error);
+    destroy_device_csr(out);
+    *out = result;
+    result = DmmaOwnedDeviceCsr();
+    if (elapsed_ms != nullptr)
+        *elapsed_ms = milliseconds(begin, Clock::now());
+    return true;
+
+failure:
+    cudaFree(d_error);
+    destroy_device_csr(&result);
+    return false;
+}
+
 static inline bool build_csc(
     const thrust::device_vector<EntryKey> &csr_tile_keys,
     cudaStream_t stream, DmmaOwnedDeviceTiles *tiles, double *elapsed_ms,
-    std::size_t *workspace_bytes)
+    std::size_t *workspace_bytes, EntryKey *csc_keys_scratch = nullptr,
+    int *csc_ids_scratch = nullptr)
 {
     const auto begin = Clock::now();
     const int count = tiles->view.num_tiles;
     if (!device_allocate(&tiles->tile_col_ptr,
-                         static_cast<std::size_t>(tiles->view.tile_col_count) + 1,
+                         static_cast<std::size_t>(
+                             tiles->view.tile_col_count) + 1,
                          "allocate B tile CSC pointer") ||
         !device_allocate(&tiles->tile_row_idx, count,
                          "allocate B tile CSC rows") ||
@@ -684,7 +1018,8 @@ static inline bool build_csc(
                          "allocate B tile CSC IDs") ||
         !dmma_cuda_ok(cudaMemsetAsync(
                           tiles->tile_col_ptr, 0,
-                          (static_cast<std::size_t>(tiles->view.tile_col_count) +
+                          (static_cast<std::size_t>(
+                               tiles->view.tile_col_count) +
                            1) * sizeof(int),
                           stream),
                       "clear B tile CSC pointer"))
@@ -692,8 +1027,17 @@ static inline bool build_csc(
 
     if (count > 0)
     {
-        thrust::device_vector<EntryKey> csc_keys(count);
-        thrust::device_vector<int> csc_ids(count);
+        thrust::device_vector<EntryKey> owned_csc_keys;
+        thrust::device_vector<int> owned_csc_ids;
+        if (csc_keys_scratch == nullptr || csc_ids_scratch == nullptr)
+        {
+            owned_csc_keys.resize(count);
+            owned_csc_ids.resize(count);
+            csc_keys_scratch =
+                thrust::raw_pointer_cast(owned_csc_keys.data());
+            csc_ids_scratch =
+                thrust::raw_pointer_cast(owned_csc_ids.data());
+        }
         *workspace_bytes = std::max(
             *workspace_bytes,
             static_cast<std::size_t>(count) *
@@ -701,22 +1045,24 @@ static inline bool build_csc(
         make_csc_keys_kernel<<<block_count(count), kThreads, 0, stream>>>(
             thrust::raw_pointer_cast(csr_tile_keys.data()), count,
             tiles->view.tile_row_count, tiles->view.tile_col_count,
-            thrust::raw_pointer_cast(csc_keys.data()),
-            thrust::raw_pointer_cast(csc_ids.data()));
+            csc_keys_scratch, csc_ids_scratch);
         if (!dmma_cuda_ok(cudaGetLastError(), "launch B tile CSC keys"))
             return false;
         auto policy = thrust::cuda::par.on(stream);
-        thrust::sort_by_key(policy, csc_keys.begin(), csc_keys.end(),
-                            csc_ids.begin());
+        auto csc_keys =
+            thrust::device_pointer_cast(csc_keys_scratch);
+        auto csc_ids =
+            thrust::device_pointer_cast(csc_ids_scratch);
+        thrust::sort_by_key(policy, csc_keys, csc_keys + count, csc_ids);
         if (!dmma_cuda_ok(cudaMemcpyAsync(
                               tiles->csc_tile_ids,
-                              thrust::raw_pointer_cast(csc_ids.data()),
+                              csc_ids_scratch,
                               static_cast<std::size_t>(count) * sizeof(int),
                               cudaMemcpyDeviceToDevice, stream),
                           "store B tile CSC IDs"))
             return false;
         finish_csc_kernel<<<block_count(count), kThreads, 0, stream>>>(
-            thrust::raw_pointer_cast(csc_keys.data()), count,
+            csc_keys_scratch, count,
             tiles->view.tile_row_count, tiles->tile_col_ptr,
             tiles->tile_row_idx);
         if (!dmma_cuda_ok(cudaGetLastError(), "launch B tile CSC metadata"))
@@ -839,7 +1185,7 @@ static inline bool build_tiles(const DmmaOwnedDeviceCsr &csr,
                 active_rows, active_cols,
                 std::numeric_limits<EntryKey>::max(),
                 thrust::raw_pointer_cast(entry_keys.data()),
-                thrust::raw_pointer_cast(entry_values.data()), nullptr);
+                thrust::raw_pointer_cast(entry_values.data()));
             if (!dmma_cuda_ok(cudaGetLastError(),
                               "launch mapped tile entry keys"))
                 return false;
@@ -1098,7 +1444,6 @@ static inline bool rebuild_dynamic_b(
         DmmaBWorkspace &workspace = out->workspace;
         workspace.entry_keys.resize(csr.nnz);
         workspace.entry_values.resize(csr.nnz);
-        workspace.source_ids.resize(csr.nnz);
         const EntryKey invalid_key = std::numeric_limits<EntryKey>::max();
         if (csr.rows > 0 && csr.nnz > 0)
         {
@@ -1109,51 +1454,21 @@ static inline bool rebuild_dynamic_b(
                 logical_transpose, inner_old_to_new, nullptr,
                 active_inner_rows, logical_cols, invalid_key,
                 thrust::raw_pointer_cast(workspace.entry_keys.data()),
-                thrust::raw_pointer_cast(workspace.entry_values.data()),
-                thrust::raw_pointer_cast(workspace.source_ids.data()));
+                thrust::raw_pointer_cast(workspace.entry_values.data()));
             if (!dmma_cuda_ok(cudaGetLastError(),
                               "launch dynamic B mapped keys"))
                 goto failure;
         }
 
         auto policy = thrust::cuda::par.on(stream);
-        auto zipped_values = thrust::make_zip_iterator(thrust::make_tuple(
-            workspace.entry_values.begin(), workspace.source_ids.begin()));
         thrust::sort_by_key(policy, workspace.entry_keys.begin(),
-                            workspace.entry_keys.end(), zipped_values);
+                            workspace.entry_keys.end(),
+                            workspace.entry_values.begin());
         const int active_entry_count = static_cast<int>(
             thrust::lower_bound(policy, workspace.entry_keys.begin(),
                                 workspace.entry_keys.end(), invalid_key) -
             workspace.entry_keys.begin());
         stats->active_entries = active_entry_count;
-
-        workspace.head_flags.resize(active_entry_count);
-        workspace.unique_ids.resize(active_entry_count);
-        if (active_entry_count > 0)
-        {
-            mark_unique_entry_heads_kernel<<<
-                block_count(active_entry_count), kThreads, 0, stream>>>(
-                thrust::raw_pointer_cast(workspace.entry_keys.data()),
-                active_entry_count,
-                thrust::raw_pointer_cast(workspace.head_flags.data()));
-            if (!dmma_cuda_ok(cudaGetLastError(),
-                              "mark dynamic B unique entries"))
-                goto failure;
-            thrust::inclusive_scan(policy, workspace.head_flags.begin(),
-                                   workspace.head_flags.end(),
-                                   workspace.unique_ids.begin());
-        }
-
-        int unique_entry_count = 0;
-        if (active_entry_count > 0 &&
-            !dmma_cuda_ok(cudaMemcpyAsync(
-                              &unique_entry_count,
-                              thrust::raw_pointer_cast(
-                                  workspace.unique_ids.data()) +
-                                  active_entry_count - 1,
-                              sizeof(int), cudaMemcpyDeviceToHost, stream),
-                          "read dynamic B unique entry count"))
-            goto failure;
 
         thrust::device_vector<EntryKey> unique_entry_keys(
             active_entry_count);
@@ -1165,11 +1480,10 @@ static inline bool rebuild_dynamic_b(
             workspace.entry_values.begin(), unique_entry_keys.begin(),
             unique_entry_values.begin(), thrust::equal_to<EntryKey>(),
             thrust::plus<MAT_VAL_TYPE>());
-        const int reduced_unique_count = static_cast<int>(
+        const int unique_entry_count = static_cast<int>(
             unique_end.first - unique_entry_keys.begin());
         if (!dmma_cuda_ok(cudaStreamSynchronize(stream),
-                          "complete dynamic B key sort/reduce") ||
-            reduced_unique_count != unique_entry_count)
+                          "complete dynamic B key sort/reduce"))
             goto failure;
         unique_entry_keys.resize(unique_entry_count);
         unique_entry_values.resize(unique_entry_count);
@@ -1299,55 +1613,13 @@ static inline bool rebuild_dynamic_b(
             goto failure;
         stats->csc_ms = csc_ms;
 
-        const auto mapping_begin = Clock::now();
-        if (csr.nnz > out->source_capacity)
-        {
-            cudaFree(out->source_to_payload);
-            out->source_to_payload = nullptr;
-            out->source_capacity = 0;
-            if (!device_allocate(&out->source_to_payload, csr.nnz,
-                                 "allocate dynamic B source mapping"))
-                goto failure;
-            out->source_capacity = csr.nnz;
-        }
-        if (csr.nnz > 0 &&
-            !dmma_cuda_ok(cudaMemsetAsync(
-                              out->source_to_payload, 0xff,
-                              static_cast<std::size_t>(csr.nnz) * sizeof(int),
-                              stream),
-                          "clear dynamic B source mapping"))
-            goto failure;
-        if (unique_entry_count > 0)
-        {
-            thrust::device_vector<int> unique_to_payload(
-                unique_entry_count);
-            build_unique_payload_map_kernel<<<tile_count, kTileThreads, 0,
-                                              stream>>>(
-                thrust::raw_pointer_cast(unique_entry_keys.data()),
-                thrust::raw_pointer_cast(entry_offsets.data()),
-                thrust::raw_pointer_cast(tile_counts.data()),
-                result.value_offsets, tile_count, dense_threshold,
-                thrust::raw_pointer_cast(unique_to_payload.data()));
-            finish_source_payload_map_kernel<<<
-                block_count(active_entry_count), kThreads, 0, stream>>>(
-                active_entry_count,
-                thrust::raw_pointer_cast(workspace.source_ids.data()),
-                thrust::raw_pointer_cast(workspace.unique_ids.data()),
-                thrust::raw_pointer_cast(unique_to_payload.data()),
-                out->source_to_payload);
-            if (!dmma_cuda_ok(cudaGetLastError(),
-                              "build dynamic B source mapping"))
-                goto failure;
-        }
         if (!dmma_cuda_ok(cudaStreamSynchronize(stream),
                           "complete dynamic B rebuild"))
             goto failure;
-        stats->mapping_ms = milliseconds(mapping_begin, Clock::now());
         stats->peak_workspace_bytes = std::max(
             stats->peak_workspace_bytes,
             static_cast<std::size_t>(csr.nnz) *
-                (sizeof(EntryKey) + sizeof(MAT_VAL_TYPE) +
-                 sizeof(int) * 3));
+                (sizeof(EntryKey) + sizeof(MAT_VAL_TYPE)));
 
         destroy_device_tiles(&out->tiles);
         out->tiles = result;
@@ -1358,16 +1630,10 @@ static inline bool rebuild_dynamic_b(
         out->active_rows = active_inner_rows;
         out->active_entries = active_entry_count;
         out->has_duplicates = active_entry_count != unique_entry_count;
-        /* Every active source is assigned the inclusive ID of its sorted
-         * structural key.  With no repeated keys, unique_to_payload maps
-         * those IDs to disjoint tile offsets (dense: physical lane; sparse:
-         * local rank), hence the active source map is injective. */
-        out->active_source_mapping_complete = true;
-        out->active_source_to_payload_injective =
-            active_entry_count == unique_entry_count;
         /* pack_tiles_kernel initializes every sparse slot and all 32 lanes
          * of every dense tile before this synchronized rebuild commits. */
         out->payload_fully_initialized = true;
+        out->fused_csr_row_permute = false;
         out->valid = true;
         stats->total_ms = milliseconds(total_begin, Clock::now());
         return true;
@@ -1389,115 +1655,398 @@ failure:
     return false;
 }
 
-static inline bool update_dynamic_b_values(
-    const MAT_VAL_TYPE *device_values, int nnz, DmmaDynamicB *matrix,
+static inline bool rebuild_dynamic_b_from_ordered_csr(
+    const DmmaDeviceCsrView &csr, const int *row_new_to_old,
+    int active_rows, int dense_threshold, DmmaDynamicB *out,
     DmmaBUpdateStats *stats, cudaStream_t stream = 0)
 {
-    if (matrix == nullptr || stats == nullptr || !matrix->valid || nnz < 0 ||
-        nnz != matrix->source_nnz ||
-        (nnz > 0 && device_values == nullptr))
+    static_assert(DMMA_TILE_K == 4 && DMMA_TILE_N == 8 &&
+                      DMMA_INPUT_ELEMS == 32,
+                  "ordered B converter requires the 4x8 B tile layout");
+    if (out == nullptr || stats == nullptr || csr.rows < 0 || csr.cols < 0 ||
+        csr.nnz < 0 || active_rows < 0 || active_rows > csr.rows ||
+        dense_threshold < 1 || dense_threshold > DMMA_INPUT_ELEMS)
         return false;
+
     *stats = DmmaBUpdateStats();
-    stats->source_entries = nnz;
-    stats->active_entries = matrix->active_entries;
-    const auto begin = Clock::now();
-    if (matrix->tiles.view.payload_size > 0 &&
-        !dmma_cuda_ok(cudaMemsetAsync(
-                          matrix->tiles.values, 0,
-                          static_cast<std::size_t>(
-                              matrix->tiles.view.payload_size) *
-                              sizeof(MAT_VAL_TYPE),
-                          stream),
-                      "clear dynamic B payload values"))
+    stats->source_entries = csr.nnz;
+    stats->structure_rebuilt = true;
+    out->valid = false;
+    const auto total_begin = Clock::now();
+    if (!validate_device_csr(csr, stream, &stats->validation_ms))
+        return false;
+
+    const int tile_row_count =
+        (active_rows + DMMA_TILE_K - 1) / DMMA_TILE_K;
+    const int tile_col_count =
+        (csr.cols + DMMA_TILE_N - 1) / DMMA_TILE_N;
+    if (static_cast<unsigned long long>(tile_row_count) *
+            static_cast<unsigned long long>(tile_col_count) >
+        std::numeric_limits<EntryKey>::max())
     {
-        matrix->valid = false;
+        std::fprintf(stderr, "Ordered B tile-key range overflow.\n");
         return false;
     }
-    if (nnz > 0)
+
+    DmmaOwnedDeviceTiles result;
+    result.view.rows = csr.rows;
+    result.view.cols = csr.cols;
+    result.view.tile_rows = DMMA_TILE_K;
+    result.view.tile_cols = DMMA_TILE_N;
+    result.view.tile_row_count = tile_row_count;
+    result.view.tile_col_count = tile_col_count;
+    unsigned long long *d_build_state = nullptr;
+    int *d_error = nullptr;
+    unsigned long long *d_active_entry_count = nullptr;
+    unsigned char *d_layout_workspace = nullptr;
+    int h_error = 0;
+    const auto tile_begin = Clock::now();
+
+    try
     {
-        update_payload_values_kernel<<<block_count(nnz), kThreads, 0,
-                                       stream>>>(
-            nnz, device_values, matrix->source_to_payload,
-            matrix->has_duplicates, matrix->tiles.values);
-        if (!dmma_cuda_ok(cudaGetLastError(),
-                          "launch dynamic B value update"))
+        if (!device_allocate(
+                &result.tile_row_ptr,
+                static_cast<std::size_t>(tile_row_count) + 1,
+                "allocate ordered B tile row pointer") ||
+            !device_allocate(&d_build_state, 2,
+                             "allocate ordered B build state") ||
+            !dmma_cuda_ok(cudaMemsetAsync(
+                              result.tile_row_ptr, 0,
+                              (static_cast<std::size_t>(tile_row_count) + 1) *
+                                  sizeof(int),
+                              stream),
+                          "clear ordered B tile row pointer") ||
+            !dmma_cuda_ok(cudaMemsetAsync(
+                              d_build_state, 0,
+                              2 * sizeof(unsigned long long), stream),
+                          "clear ordered B build state"))
+            goto failure_ordered;
+        d_error = reinterpret_cast<int *>(d_build_state);
+        d_active_entry_count = d_build_state + 1;
+
+        constexpr int kWarpsPerBlock = kThreads / 32;
+        const int warp_blocks =
+            (tile_row_count + kWarpsPerBlock - 1) / kWarpsPerBlock;
+        if (tile_row_count > 0)
         {
-            matrix->valid = false;
-            return false;
+            count_ordered_b_tile_rows_warp_kernel<<<warp_blocks, kThreads, 0,
+                                                    stream>>>(
+                csr.row_ptr, csr.col_idx, csr.rows, row_new_to_old,
+                active_rows, result.tile_row_ptr, d_active_entry_count,
+                d_error);
+            if (!dmma_cuda_ok(cudaGetLastError(),
+                              "count ordered B tile rows"))
+                goto failure_ordered;
         }
+        auto policy = thrust::cuda::par.on(stream);
+        auto tile_row_ptr =
+            thrust::device_pointer_cast(result.tile_row_ptr);
+        thrust::inclusive_scan(
+            policy, tile_row_ptr,
+            tile_row_ptr + static_cast<std::size_t>(tile_row_count) + 1,
+            tile_row_ptr);
+
+        int tile_count = 0;
+        unsigned long long active_entry_count_wide = 0;
+        if (!dmma_cuda_ok(cudaMemcpyAsync(
+                              &tile_count,
+                              result.tile_row_ptr + tile_row_count,
+                              sizeof(int), cudaMemcpyDeviceToHost, stream),
+                          "read ordered B tile count") ||
+            !dmma_cuda_ok(cudaMemcpyAsync(
+                              &active_entry_count_wide,
+                              d_active_entry_count,
+                              sizeof(unsigned long long),
+                              cudaMemcpyDeviceToHost, stream),
+                          "read ordered B active entry count") ||
+            !dmma_cuda_ok(cudaMemcpyAsync(
+                              &h_error, d_error, sizeof(int),
+                              cudaMemcpyDeviceToHost, stream),
+                          "read ordered B count error") ||
+            !dmma_cuda_ok(cudaStreamSynchronize(stream),
+                          "complete ordered B tile count"))
+            goto failure_ordered;
+        if (h_error == 1)
+        {
+            cudaFree(d_build_state);
+            d_build_state = nullptr;
+            d_error = nullptr;
+            d_active_entry_count = nullptr;
+            destroy_device_tiles(&result);
+            DmmaOwnedDeviceCsr permuted;
+            double row_permute_ms = 0.0;
+            if (!permute_device_csr_rows(
+                    csr, row_new_to_old, stream, &permuted,
+                    &row_permute_ms))
+                return false;
+            DmmaBUpdateStats fallback_stats;
+            const bool rebuilt = rebuild_dynamic_b(
+                device_csr_view(permuted), nullptr, active_rows,
+                dense_threshold, out,
+                &fallback_stats, stream, false);
+            const std::size_t permuted_csr_bytes =
+                (static_cast<std::size_t>(permuted.rows) + 1) *
+                    sizeof(int) +
+                static_cast<std::size_t>(permuted.nnz) *
+                    (sizeof(int) + sizeof(MAT_VAL_TYPE));
+            destroy_device_csr(&permuted);
+            if (!rebuilt)
+                return false;
+            *stats = fallback_stats;
+            stats->csr_row_permute_ms = row_permute_ms;
+            stats->peak_workspace_bytes += permuted_csr_bytes;
+            stats->ordered_csr_fallback = true;
+            stats->total_ms = milliseconds(total_begin, Clock::now());
+            return true;
+        }
+        if (h_error != 0)
+            goto failure_ordered;
+        if (active_entry_count_wide >
+            static_cast<unsigned long long>(
+                std::numeric_limits<int>::max()))
+        {
+            std::fprintf(stderr,
+                         "Ordered B active entry count exceeds 32-bit range.\n");
+            goto failure_ordered;
+        }
+        const int active_entry_count =
+            static_cast<int>(active_entry_count_wide);
+        const auto count_end = Clock::now();
+        stats->ordered_count_ms =
+            milliseconds(tile_begin, count_end);
+
+        thrust::device_vector<EntryKey> tile_keys(tile_count);
+        const std::size_t tile_count_size =
+            static_cast<std::size_t>(tile_count);
+        const std::size_t metadata_words =
+            3 * tile_count_size + 1;
+        int *metadata_storage = nullptr;
+        const std::size_t layout_int_bytes =
+            3 * tile_count_size * sizeof(int);
+        const std::size_t totals_offset =
+            (layout_int_bytes + alignof(unsigned long long) - 1) &
+            ~(alignof(unsigned long long) - 1);
+        const std::size_t layout_workspace_bytes =
+            totals_offset + 3 * sizeof(unsigned long long);
+        if (!device_allocate(&metadata_storage, metadata_words,
+                             "allocate ordered B metadata slab"))
+            goto failure_ordered;
+        result.metadata_storage = metadata_storage;
+        result.tile_col_idx = metadata_storage;
+        result.value_offsets = metadata_storage + tile_count_size;
+        result.masks = reinterpret_cast<uint32_t *>(
+            metadata_storage + 2 * tile_count_size + 1);
+        if (!device_allocate(&d_layout_workspace, layout_workspace_bytes,
+                             "allocate ordered B layout workspace"))
+            goto failure_ordered;
+        int *tile_entry_counts =
+            reinterpret_cast<int *>(d_layout_workspace);
+        int *payload_spans = tile_entry_counts + tile_count_size;
+        int *dense_flags = payload_spans + tile_count_size;
+        auto *d_totals = reinterpret_cast<unsigned long long *>(
+            d_layout_workspace + totals_offset);
+        if (!dmma_cuda_ok(cudaMemsetAsync(
+                              d_totals, 0,
+                              3 * sizeof(unsigned long long), stream),
+                          "clear ordered B tile totals") ||
+            !dmma_cuda_ok(cudaMemsetAsync(
+                              result.value_offsets, 0, sizeof(int), stream),
+                          "initialize ordered B value offsets"))
+            goto failure_ordered;
+
+        if (tile_row_count > 0)
+        {
+            fill_ordered_b_tile_metadata_warp_kernel<<<
+                warp_blocks, kThreads, 0, stream>>>(
+                csr.row_ptr, csr.col_idx, active_rows, row_new_to_old,
+                tile_col_count, result.tile_row_ptr, result.tile_col_idx,
+                tile_entry_counts,
+                thrust::raw_pointer_cast(tile_keys.data()), result.masks,
+                d_error);
+            if (!dmma_cuda_ok(cudaGetLastError(),
+                              "build ordered B tile metadata"))
+                goto failure_ordered;
+        }
+        if (tile_count > 0)
+        {
+            prepare_ordered_b_payload_layout_kernel<<<
+                block_count(tile_count), kThreads, 0, stream>>>(
+                tile_entry_counts, tile_count, dense_threshold,
+                payload_spans, dense_flags);
+            if (!dmma_cuda_ok(cudaGetLastError(),
+                              "prepare ordered B payload layout"))
+                goto failure_ordered;
+        }
+
+        auto value_offsets =
+            thrust::device_pointer_cast(result.value_offsets);
+        if (tile_count > 0)
+        {
+            auto payload_span_ptr =
+                thrust::device_pointer_cast(payload_spans);
+            thrust::inclusive_scan(
+                policy, payload_span_ptr,
+                payload_span_ptr + tile_count,
+                value_offsets + 1);
+            reduce_ordered_b_tile_stats_kernel<<<
+                block_count(tile_count), kThreads, 0, stream>>>(
+                tile_entry_counts, dense_flags, payload_spans, tile_count,
+                d_totals);
+            if (!dmma_cuda_ok(cudaGetLastError(),
+                              "reduce ordered B tile statistics"))
+                goto failure_ordered;
+        }
+        unsigned long long h_totals[3] = {0, 0, 0};
+        if (!dmma_cuda_ok(cudaMemcpyAsync(
+                              h_totals, d_totals,
+                              3 * sizeof(unsigned long long),
+                              cudaMemcpyDeviceToHost, stream),
+                          "read ordered B tile totals") ||
+            !dmma_cuda_ok(cudaStreamSynchronize(stream),
+                          "complete ordered B layout scan"))
+            goto failure_ordered;
+        const auto layout_end = Clock::now();
+        stats->ordered_layout_ms =
+            milliseconds(count_end, layout_end);
+        const unsigned long long payload_size_wide = h_totals[2];
+        if (payload_size_wide > std::numeric_limits<int>::max())
+        {
+            std::fprintf(stderr,
+                         "Ordered B payload exceeds 32-bit offsets.\n");
+            goto failure_ordered;
+        }
+        const int payload_size =
+            static_cast<int>(payload_size_wide);
+        if (h_totals[0] >
+                static_cast<unsigned long long>(
+                    std::numeric_limits<int>::max()) ||
+            h_totals[1] >
+                static_cast<unsigned long long>(
+                    std::numeric_limits<int>::max()))
+        {
+            std::fprintf(stderr,
+                         "Ordered B tile statistics exceed 32-bit range.\n");
+            goto failure_ordered;
+        }
+        const int unique_entry_count =
+            static_cast<int>(h_totals[0]);
+        const int dense_tiles = static_cast<int>(h_totals[1]);
+        if (!device_allocate(&result.values, payload_size,
+                             "allocate ordered B payload"))
+            goto failure_ordered;
+        const auto payload_alloc_end = Clock::now();
+        stats->ordered_payload_alloc_ms =
+            milliseconds(layout_end, payload_alloc_end);
+
+        if (tile_row_count > 0)
+        {
+            fill_ordered_b_payload_warp_kernel<<<warp_blocks, kThreads, 0,
+                                                 stream>>>(
+                csr.row_ptr, csr.col_idx, csr.values, active_rows,
+                row_new_to_old, dense_threshold, result.tile_row_ptr,
+                tile_entry_counts,
+                result.value_offsets, result.masks, result.values, d_error);
+            if (!dmma_cuda_ok(cudaGetLastError(),
+                              "pack ordered B tile payload"))
+                goto failure_ordered;
+        }
+        if (!dmma_cuda_ok(cudaMemcpyAsync(
+                              &h_error, d_error, sizeof(int),
+                              cudaMemcpyDeviceToHost, stream),
+                          "read ordered B build error") ||
+            !dmma_cuda_ok(cudaStreamSynchronize(stream),
+                          "complete ordered B tile packing") ||
+            h_error != 0)
+            goto failure_ordered;
+        const auto payload_fill_end = Clock::now();
+        stats->ordered_payload_fill_ms =
+            milliseconds(payload_alloc_end, payload_fill_end);
+        stats->ordered_pack_ms =
+            milliseconds(count_end, payload_fill_end);
+
+        result.view.num_tiles = tile_count;
+        result.view.payload_size = payload_size;
+        result.view.dense_tiles = dense_tiles;
+        result.view.sparse_tiles = tile_count - dense_tiles;
+        result.view.structural_nnz =
+            static_cast<unsigned long long>(unique_entry_count);
+        result.view.tile_row_ptr = result.tile_row_ptr;
+        result.view.tile_col_idx = result.tile_col_idx;
+        result.view.value_offsets = result.value_offsets;
+        result.view.masks = result.masks;
+        result.view.values = result.values;
+        stats->active_entries = active_entry_count;
+        stats->unique_entries = unique_entry_count;
+        stats->tile_build_ms = milliseconds(tile_begin, Clock::now());
+        stats->peak_workspace_bytes = std::max(
+            stats->peak_workspace_bytes,
+            static_cast<std::size_t>(tile_count) *
+                (2 * sizeof(EntryKey) + 4 * sizeof(int)));
+
+        double csc_ms = 0.0;
+        auto *csc_keys_scratch =
+            reinterpret_cast<EntryKey *>(d_layout_workspace);
+        int *csc_ids_scratch = reinterpret_cast<int *>(
+            d_layout_workspace +
+            static_cast<std::size_t>(tile_count) * sizeof(EntryKey));
+        if (!build_csc(tile_keys, stream, &result, &csc_ms,
+                       &stats->peak_workspace_bytes, csc_keys_scratch,
+                       csc_ids_scratch))
+            goto failure_ordered;
+        stats->csc_ms = csc_ms;
+        cudaFree(d_layout_workspace);
+        d_layout_workspace = nullptr;
+
+        cudaFree(d_build_state);
+        d_build_state = nullptr;
+        d_error = nullptr;
+        d_active_entry_count = nullptr;
+        destroy_device_tiles(&out->tiles);
+        out->tiles = result;
+        result = DmmaOwnedDeviceTiles();
+        out->source_nnz = csr.nnz;
+        out->source_rows = csr.rows;
+        out->source_cols = csr.cols;
+        out->active_rows = active_rows;
+        out->active_entries = active_entry_count;
+        out->has_duplicates =
+            active_entry_count != unique_entry_count;
+        out->payload_fully_initialized = true;
+        out->fused_csr_row_permute = row_new_to_old != nullptr;
+        out->valid = true;
+        stats->fused_csr_row_permute = row_new_to_old != nullptr;
+        stats->total_ms = milliseconds(total_begin, Clock::now());
+        return true;
     }
-    if (!dmma_cuda_ok(cudaStreamSynchronize(stream),
-                      "complete dynamic B value update"))
+    catch (const std::bad_alloc &)
     {
-        matrix->valid = false;
-        return false;
+        std::fprintf(stderr,
+                     "Ordered B rebuild host allocation failed.\n");
     }
-    stats->value_update_ms = milliseconds(begin, Clock::now());
-    stats->total_ms = stats->value_update_ms;
-    return true;
+    catch (const thrust::system_error &error)
+    {
+        std::fprintf(stderr, "Ordered B rebuild Thrust failure: %s\n",
+                     error.what());
+    }
+
+failure_ordered:
+    cudaFree(d_layout_workspace);
+    cudaFree(d_build_state);
+    destroy_device_tiles(&result);
+    out->valid = false;
+    return false;
 }
 
-/* Optional fast path.  The legacy entry point above remains byte-for-byte in
- * charge of the default always-clear policy.  This separate function is used
- * only for an explicit non-default policy, so the default Core path gains no
- * policy-selection work. */
-static inline bool update_dynamic_b_values_with_policy(
-    const MAT_VAL_TYPE *device_values, int nnz, DmmaDynamicB *matrix,
-    DmmaBValuesClearPolicy policy, DmmaBValuesClearDecision *decision_out,
+static inline bool rebuild_dynamic_b_via_permuted_csr(
+    const DmmaDeviceCsrView &source, const int *row_new_to_old,
+    int active_rows, int dense_threshold, DmmaDynamicB *out,
     DmmaBUpdateStats *stats, cudaStream_t stream = 0)
 {
-    if (matrix == nullptr || stats == nullptr || decision_out == nullptr ||
-        !matrix->valid || nnz < 0 || nnz != matrix->source_nnz ||
-        (nnz > 0 && device_values == nullptr) ||
-        policy == DMMA_B_VALUES_ALWAYS_CLEAR)
+    if (out == nullptr || stats == nullptr)
         return false;
-
-    *stats = DmmaBUpdateStats();
-    stats->source_entries = nnz;
-    stats->active_entries = matrix->active_entries;
-    const auto begin = Clock::now();
-    const DmmaBValuesClearDecision decision = dmma_choose_b_values_clear(
-        policy, true, matrix->valid, matrix->has_duplicates,
-        matrix->active_source_mapping_complete,
-        matrix->active_source_to_payload_injective,
-        matrix->payload_fully_initialized,
-        matrix->tiles.view.dense_tiles == 0, true);
-    *decision_out = decision;
-
-    if (decision.clear_payload && matrix->tiles.view.payload_size > 0 &&
-        !dmma_cuda_ok(cudaMemsetAsync(
-                          matrix->tiles.values, 0,
-                          static_cast<std::size_t>(
-                              matrix->tiles.view.payload_size) *
-                              sizeof(MAT_VAL_TYPE),
-                          stream),
-                      "clear dynamic B payload values (safe fallback)"))
-    {
-        matrix->valid = false;
-        return false;
-    }
-    if (nnz > 0)
-    {
-        update_payload_values_kernel<<<block_count(nnz), kThreads, 0,
-                                       stream>>>(
-            nnz, device_values, matrix->source_to_payload,
-            matrix->has_duplicates, matrix->tiles.values);
-        if (!dmma_cuda_ok(cudaGetLastError(),
-                          "launch dynamic B value update"))
-        {
-            matrix->valid = false;
-            return false;
-        }
-    }
-    if (!dmma_cuda_ok(cudaStreamSynchronize(stream),
-                      "complete dynamic B value update"))
-    {
-        matrix->valid = false;
-        return false;
-    }
-    stats->value_update_ms = milliseconds(begin, Clock::now());
-    stats->total_ms = stats->value_update_ms;
-    return true;
+    return rebuild_dynamic_b_from_ordered_csr(
+        source, row_new_to_old, active_rows, dense_threshold, out, stats,
+        stream);
 }
 
 static inline bool compute_nnz_cub(const DmmaOwnedDeviceCsr &csr, bool aat,
@@ -1604,8 +2153,7 @@ static inline bool compute_nnz_cub_ab(
 /* Best-effort preparation for ExactTile-Sparse v1.  Failure invalidates only
  * the optional metadata and leaves the base hybrid tiles intact, so the next
  * SpGEMM call can select the unchanged RTT path.  Main calls A-row setup in
- * offline preprocessing and B-column setup after every structural rebuild;
- * values-only B updates reuse the sums because masks are unchanged. */
+ * offline preprocessing and B-column setup after every online B rebuild. */
 static inline bool gpu_prepare_low_fill_exact_tile_metadata(
     DmmaOwnedDeviceTiles *tiles, bool build_row_sums, bool build_col_sums,
     cudaStream_t stream = 0)
@@ -1724,14 +2272,14 @@ static inline bool gpu_upload_csr(const SMatrix &host,
     return true;
 }
 
-static inline bool gpu_rebuild_dynamic_b(
-    const DmmaDeviceCsrView &csr, const int *inner_old_to_new,
+static inline bool gpu_rebuild_dynamic_b_via_permuted_csr(
+    const DmmaDeviceCsrView &csr, const int *inner_new_to_old,
     int active_inner_rows, int dense_threshold, DmmaDynamicB *out,
     DmmaBUpdateStats *stats, cudaStream_t stream = 0)
 {
-    return gpu_dmma_detail::rebuild_dynamic_b(
-        csr, inner_old_to_new, active_inner_rows, dense_threshold, out, stats,
-        stream, false);
+    return gpu_dmma_detail::rebuild_dynamic_b_via_permuted_csr(
+        csr, inner_new_to_old, active_inner_rows, dense_threshold, out, stats,
+        stream);
 }
 
 static inline bool gpu_rebuild_dynamic_b_transpose(
@@ -1742,23 +2290,6 @@ static inline bool gpu_rebuild_dynamic_b_transpose(
     return gpu_dmma_detail::rebuild_dynamic_b(
         source, inner_old_to_new, active_inner_rows, dense_threshold, out,
         stats, stream, true);
-}
-
-static inline bool gpu_update_dynamic_b_values(
-    const MAT_VAL_TYPE *device_values, int nnz, DmmaDynamicB *matrix,
-    DmmaBUpdateStats *stats, cudaStream_t stream = 0)
-{
-    return gpu_dmma_detail::update_dynamic_b_values(
-        device_values, nnz, matrix, stats, stream);
-}
-
-static inline bool gpu_update_dynamic_b_values_with_policy(
-    const MAT_VAL_TYPE *device_values, int nnz, DmmaDynamicB *matrix,
-    DmmaBValuesClearPolicy policy, DmmaBValuesClearDecision *decision,
-    DmmaBUpdateStats *stats, cudaStream_t stream = 0)
-{
-    return gpu_dmma_detail::update_dynamic_b_values_with_policy(
-        device_values, nnz, matrix, policy, decision, stats, stream);
 }
 
 static inline bool gpu_compute_nnz_cub_ab(

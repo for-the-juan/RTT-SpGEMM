@@ -67,8 +67,6 @@ struct Options
     int iterations = 5;
     bool tileflex16_symbolic = true;
     BUpdateMode b_update = B_UPDATE_NONE;
-    DmmaBValuesClearPolicy b_values_clear_policy =
-        DMMA_B_VALUES_ALWAYS_CLEAR;
     CusparseBenchmarkMode cusparse_benchmark = CUSPARSE_BENCHMARK_OFF;
     CoreTargetMode core_target = CORE_TARGET_OURS;
     CusparseWorkspacePolicy cusparse_workspace =
@@ -1334,28 +1332,34 @@ static void print_a_stats(const DmmaPreparedA &prepared,
 static void print_b_update_stats(const char *label,
                                  const DmmaBUpdateStats &stats)
 {
-    if (stats.structure_rebuilt)
-    {
-        std::printf(
-            "%s B structure: total=%.3f ms validation=%.3f "
-            "sort/reduce=%.3f tile-build=%.3f CSC=%.3f mapping=%.3f "
-            "low-fill-metadata=%.3f C16-view=%.3f; "
-            "entries source=%d active=%d unique=%d; peak=%.2f MB\n",
-            label, stats.total_ms, stats.validation_ms,
-            stats.key_sort_reduce_ms, stats.tile_build_ms, stats.csc_ms,
-            stats.mapping_ms, stats.low_fill_metadata_ms,
-            stats.super16_build_ms,
-            stats.source_entries, stats.active_entries, stats.unique_entries,
-            static_cast<double>(stats.peak_workspace_bytes) /
-                (1024.0 * 1024.0));
-    }
-    else
-    {
-        std::printf("%s B values: total=%.3f ms value-update=%.3f ms; "
-                    "source entries=%d\n",
-                    label, stats.total_ms, stats.value_update_ms,
-                    stats.source_entries);
-    }
+    std::printf(
+        "%s B structure: total=%.3f ms CSR-row-permute=%.3f "
+        "validation=%.3f "
+        "sort/reduce=%.3f tile-build=%.3f "
+        "(ordered-count=%.3f ordered-pack=%.3f "
+        "layout=%.3f payload-malloc=%.3f payload-fill=%.3f) "
+        "CSC=%.3f mapping=%.3f "
+        "low-fill-metadata=%.3f C16-view=%.3f; "
+        "entries source=%d active=%d unique=%d; peak=%.2f MB; "
+        "path=%s\n",
+        label, stats.total_ms, stats.csr_row_permute_ms,
+        stats.validation_ms,
+        stats.key_sort_reduce_ms, stats.tile_build_ms,
+        stats.ordered_count_ms, stats.ordered_pack_ms,
+        stats.ordered_layout_ms, stats.ordered_payload_alloc_ms,
+        stats.ordered_payload_fill_ms, stats.csc_ms,
+        stats.mapping_ms, stats.low_fill_metadata_ms,
+        stats.super16_build_ms,
+        stats.source_entries, stats.active_entries, stats.unique_entries,
+        static_cast<double>(stats.peak_workspace_bytes) /
+            (1024.0 * 1024.0),
+        stats.ordered_csr_fallback
+            ? "CSR-row-permute-then-unsorted-CSR2Tile-fallback"
+            : (stats.fused_csr_row_permute
+                   ? "CSR-row-permute+ordered-CSR2Tile-fused-warp"
+                   : (stats.csr_row_permute_ms > 0.0
+                   ? "CSR-row-permute-then-ordered-CSR2Tile-warp"
+                   : "mapped-CSR2Tile")));
 }
 
 static const char *b_update_mode_name(BUpdateMode mode)
@@ -1367,59 +1371,36 @@ static const char *b_update_mode_name(BUpdateMode mode)
     return mode == B_UPDATE_PERMUTATION ? "permutation" : "structure";
 }
 
-static bool b_update_uses_online_value_scatter(BUpdateMode mode)
-{
-    return mode == B_UPDATE_NONE || mode == B_UPDATE_VALUES;
-}
-
 static const char *b_update_semantics_name(BUpdateMode mode)
 {
     if (mode == B_UPDATE_NONE)
-        return "unchanged-values-online-permutation";
+        return "unchanged-input-full-csr-row-permute-and-format-rebuild";
     if (mode == B_UPDATE_VALUES)
-        return "changed-values-online-permutation";
-    return mode == B_UPDATE_PERMUTATION ? "permutation-rebuild"
-                                        : "structure-rebuild";
+        return "changed-values-full-csr-row-permute-and-format-rebuild";
+    return mode == B_UPDATE_PERMUTATION
+               ? "permutation-full-csr-row-permute-and-format-rebuild"
+               : "structure-full-csr-row-permute-and-format-rebuild";
 }
 
-static void print_b_values_clear_marker(
+static void print_b_online_prep_marker(
     const char *phase, int iteration, const Options &options,
-    const DmmaDynamicB &matrix, const DmmaBValuesClearDecision &decision)
+    const DmmaDynamicB &matrix)
 {
-    const bool values_only =
-        b_update_uses_online_value_scatter(options.b_update);
-    const std::size_t payload_bytes =
-        static_cast<std::size_t>(matrix.tiles.view.payload_size) *
-        sizeof(MAT_VAL_TYPE);
     std::printf(
-        "B_VALUES_CLEAR phase=%s iteration=%d requested=%s "
-        "effective=%s values_only=%d online_value_scatter=%d "
-        "logical_values_changed=%d clear_executed=%d "
-        "clear_skipped=%d fallback=%d reason=%s payload_bytes=%zu "
+        "B_ONLINE_PREP phase=%s iteration=%d mode=%s "
+        "path=%s "
+        "source_mapping=disabled value_scatter=disabled "
         "active_entries=%d active_duplicates=%d "
-        "active_mapping_complete=%d active_mapping_injective=%d "
-        "payload_initialized=%d dense_tiles=%d "
-        "every_payload_slot_overwritten=%d numeric_b_read_only=1 "
-        "source_aliases_a=%d structure_legacy_rebuild=%d\n",
-        phase, iteration,
-        dmma_b_values_clear_policy_name(options.b_values_clear_policy),
-        values_only ? (decision.skip_clear ? "noclear" : "clear")
-                    : "structure-rebuild",
-        values_only ? 1 : 0,
-        values_only ? 1 : 0,
-        options.b_update == B_UPDATE_VALUES ? 1 : 0,
-        values_only && decision.clear_payload && payload_bytes > 0 ? 1 : 0,
-        values_only && decision.skip_clear ? 1 : 0,
-        decision.fallback ? 1 : 0,
-        dmma_b_values_clear_reason_name(decision.reason), payload_bytes,
+        "payload_initialized=%d dense_tiles=%d numeric_b_read_only=1 "
+        "source_aliases_a=%d\n",
+        phase, iteration, b_update_mode_name(options.b_update),
+        matrix.fused_csr_row_permute
+            ? "CSR-row-permute+ordered-CSR2Tile-fused-warp"
+            : "CSR-row-permute-then-CSR2Tile",
         matrix.active_entries, matrix.has_duplicates ? 1 : 0,
-        matrix.active_source_mapping_complete ? 1 : 0,
-        matrix.active_source_to_payload_injective ? 1 : 0,
         matrix.payload_fully_initialized ? 1 : 0,
         matrix.tiles.view.dense_tiles,
-        matrix.tiles.view.dense_tiles == 0 ? 1 : 0,
-        options.b_filename == nullptr ? 1 : 0,
-        options.b_update == B_UPDATE_STRUCTURE ? 1 : 0);
+        options.b_filename == nullptr ? 1 : 0);
 }
 
 static bool rebuild_b(const Options &options, const DmmaPreparedA &a,
@@ -1429,19 +1410,21 @@ static bool rebuild_b(const Options &options, const DmmaPreparedA &a,
 {
     const int *inner_old_to_new = apply_permutation
         ? a.reorder.d_inner_old_to_new : nullptr;
+    const int *inner_new_to_old = apply_permutation
+        ? a.reorder.d_inner_new_to_old : nullptr;
     const int active_inner = a.reorder.active_inner;
     bool rebuilt = false;
     if (options.b_filename != nullptr)
-        rebuilt = gpu_rebuild_dynamic_b(
-            device_csr_view(independent_b), inner_old_to_new, active_inner,
-            options.dense_threshold, b, stats);
+        rebuilt = gpu_rebuild_dynamic_b_via_permuted_csr(
+            device_csr_view(independent_b), inner_new_to_old,
+            active_inner, options.dense_threshold, b, stats);
     else if (options.aat != 0)
         rebuilt = gpu_rebuild_dynamic_b_transpose(
             device_csr_view(a.csr), inner_old_to_new, active_inner,
             options.dense_threshold, b, stats);
     else
-        rebuilt = gpu_rebuild_dynamic_b(
-            device_csr_view(a.csr), inner_old_to_new, active_inner,
+        rebuilt = gpu_rebuild_dynamic_b_via_permuted_csr(
+            device_csr_view(a.csr), inner_new_to_old, active_inner,
             options.dense_threshold, b, stats);
     if (rebuilt && options.low_fill_exact_tile != 0)
     {
@@ -1638,18 +1621,15 @@ int main(int argc, char **argv)
                 "dense threshold=%d/32\n",
                 options.dense_threshold);
     std::printf(
-        "B_VALUES_CLEAR_CONFIG requested=%s default=always-clear "
-        "default_off=1 legacy_entrypoint_unchanged=1 "
-        "eligibility=online-value-scatter+valid+no-active-duplicates+"
-        "complete-injective-active-map+initialized-payload+sparse-only+"
-        "read-only-numeric "
-        "unsafe_action=clear-fallback timing_boundary=unchanged\n",
-        dmma_b_values_clear_policy_name(options.b_values_clear_policy));
+        "B_ONLINE_PREP_CONFIG input=device-CSR "
+        "stages=CSR-row-permute+ordered-CSR2Tile-fused-warp+C16-view "
+        "source_mapping=disabled value_scatter=disabled "
+        "malloc_metadata_included=1\n");
     std::printf(
         "B_UPDATE_CONTRACT mode=%s semantics=%s scatter_inside_core=%d\n",
         b_update_mode_name(options.b_update),
         b_update_semantics_name(options.b_update),
-        b_update_uses_online_value_scatter(options.b_update) ? 1 : 0);
+        0);
     std::printf("NUMERIC_SCHEDULE mode=%s direct_layout=%s "
                 "reduction=%s launch_policy=%s "
                 "light_policy=%s critical_q_min=%.9f "
@@ -1776,12 +1756,8 @@ int main(int argc, char **argv)
     std::printf("CORE_COMPARABILITY b_update=%s comparable=%d "
                 "reason=%s\n",
                 b_update_mode_name(options.b_update),
-                options.b_update != B_UPDATE_STRUCTURE ? 1 : 0,
-                options.b_update == B_UPDATE_NONE
-                    ? "unchanged-values-online-permutation"
-                    : (options.b_update == B_UPDATE_VALUES
-                           ? "matched-online-values-contract"
-                           : "cusparse-controls-do-not-rebuild-structure"));
+                0,
+                "controls-do-not-include-full-B-csr-row-permute-and-format");
     const bool core_target_runs_ours =
         options.core_target != CORE_TARGET_CUSPARSE;
     const bool core_target_runs_cusparse =
@@ -1860,6 +1836,12 @@ int main(int argc, char **argv)
     unsigned long long nnz_cub = 0;
     double nnz_cub_ms = 0.0;
     std::vector<double> b_update_times;
+    std::vector<double> b_csr_row_permute_times;
+    std::vector<double> b_csr2tile_times;
+    std::vector<double> b_sort_reduce_times;
+    std::vector<double> b_tile_build_times;
+    std::vector<double> b_csc_build_times;
+    std::vector<double> b_c16_view_times;
     std::vector<double> dmma_times;
     std::vector<double> combined_times;
     std::vector<double> single_shot_all_cost_times;
@@ -1876,10 +1858,7 @@ int main(int argc, char **argv)
     DmmaDirectNumericLayout summary_direct_numeric_layout =
         schedule_config.direct_numeric_layout;
     bool summary_direct_numeric_layout_initialized = false;
-    int b_values_clear_timed_samples = 0;
-    int b_values_noclear_timed_samples = 0;
-    int b_values_clear_fallback_timed_samples = 0;
-
+    bool summary_fused_csr_row_permute = false;
     bool a_ready = false;
     if (options.no_reorder)
         a_ready = gpu_prepare_identity_a(
@@ -2036,20 +2015,16 @@ int main(int argc, char **argv)
                     dynamic_b.tiles.view.tile_col_count) * sizeof(uint32_t),
                 dynamic_b.tiles.view.low_fill_metadata_overflow ? 1 : 0);
         std::printf(
-            "B_VALUES_CLEAR_INVARIANTS active_entries=%d "
-            "active_duplicates=%d active_mapping_complete=%d "
-            "active_mapping_injective=%d "
+            "B_ONLINE_PREP_INVARIANTS active_entries=%d "
+            "active_duplicates=%d source_mapping_allocated=%d "
             "payload_initialized_by_pack=%d dense_tiles=%d "
-            "every_payload_slot_overwritten_each_update=%d "
             "numeric_b_read_only=1 source_aliases_a=%d "
             "dense_padding_initialized_zero=1 sparse_payload_padding=0\n",
             dynamic_b.active_entries,
             dynamic_b.has_duplicates ? 1 : 0,
-            dynamic_b.active_source_mapping_complete ? 1 : 0,
-            dynamic_b.active_source_to_payload_injective ? 1 : 0,
+            0,
             dynamic_b.payload_fully_initialized ? 1 : 0,
             dynamic_b.tiles.view.dense_tiles,
-            dynamic_b.tiles.view.dense_tiles == 0 ? 1 : 0,
             general_ab ? 0 : 1);
     }
 
@@ -2057,12 +2032,6 @@ int main(int argc, char **argv)
     {
         schedule_config.super16_a = prepared_a.super16.view();
         schedule_config.super16_b = dynamic_b.super16.view();
-    }
-
-    if (b_update_uses_online_value_scatter(options.b_update))
-    {
-        release_dynamic_b_rebuild_workspace(&dynamic_b);
-        release_dmma_reorder_device_maps(&prepared_a.reorder);
     }
 
     if (general_ab)
@@ -2121,6 +2090,12 @@ int main(int argc, char **argv)
         dmma_light_policy_name(schedule_config.light_policy));
 
     b_update_times.reserve(options.iterations);
+    b_csr_row_permute_times.reserve(options.iterations);
+    b_csr2tile_times.reserve(options.iterations);
+    b_sort_reduce_times.reserve(options.iterations);
+    b_tile_build_times.reserve(options.iterations);
+    b_csc_build_times.reserve(options.iterations);
+    b_c16_view_times.reserve(options.iterations);
     dmma_times.reserve(options.iterations);
     combined_times.reserve(options.iterations);
     single_shot_all_cost_times.reserve(options.iterations);
@@ -2138,41 +2113,13 @@ int main(int argc, char **argv)
         DmmaNumericScheduleConfig warmup_schedule = schedule_config;
         warmup_schedule.materialize_output = false;
         bool update_ok = false;
-        DmmaBValuesClearDecision update_clear_decision =
-            dmma_choose_b_values_clear(
-                options.b_values_clear_policy,
-                b_update_uses_online_value_scatter(options.b_update),
-                dynamic_b.valid,
-                dynamic_b.has_duplicates,
-                dynamic_b.active_source_mapping_complete,
-                dynamic_b.active_source_to_payload_injective,
-                dynamic_b.payload_fully_initialized,
-                dynamic_b.tiles.view.dense_tiles == 0, true);
         if (!dmma_cuda_ok(cudaDeviceSynchronize(),
                           "presynchronize ours warmup Core sample"))
             goto cleanup;
         const std::chrono::steady_clock::time_point core_begin =
             std::chrono::steady_clock::now();
-        if (options.b_update == B_UPDATE_STRUCTURE ||
-            options.b_update == B_UPDATE_PERMUTATION)
-        {
-            update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
-                                  &update_stats);
-        }
-        else
-        {
-            const DmmaOwnedDeviceCsr &source =
-                general_ab ? device_b : prepared_a.csr;
-            if (options.b_values_clear_policy ==
-                DMMA_B_VALUES_ALWAYS_CLEAR)
-                update_ok = gpu_update_dynamic_b_values(
-                    source.values, source.nnz, &dynamic_b, &update_stats);
-            else
-                update_ok = gpu_update_dynamic_b_values_with_policy(
-                    source.values, source.nnz, &dynamic_b,
-                    options.b_values_clear_policy, &update_clear_decision,
-                    &update_stats);
-        }
+        update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
+                              &update_stats);
         if (update_ok && options.tileflex16_symbolic)
             warmup_schedule.super16_b = dynamic_b.super16.view();
         if (!update_ok ||
@@ -2190,8 +2137,8 @@ int main(int argc, char **argv)
         }
         const double warmup_core_ms =
             elapsed_ms(core_begin, warmup_stats.core_completion_wall);
-        print_b_values_clear_marker("warmup", warmup + 1, options,
-                                    dynamic_b, update_clear_decision);
+        print_b_online_prep_marker("warmup", warmup + 1, options,
+                                   dynamic_b);
         std::printf("CORE_BENCH method=ours backend=rtt input=same-order "
                     "phase=warmup warmup=1 iteration=%d core_ms=%.6f "
                     "b_update_ms=%.6f b_update_wall_ms=%.6f "
@@ -2235,41 +2182,13 @@ int main(int argc, char **argv)
                 ? options.task_trace_filename
                 : nullptr;
         bool update_ok = false;
-        DmmaBValuesClearDecision update_clear_decision =
-            dmma_choose_b_values_clear(
-                options.b_values_clear_policy,
-                b_update_uses_online_value_scatter(options.b_update),
-                dynamic_b.valid,
-                dynamic_b.has_duplicates,
-                dynamic_b.active_source_mapping_complete,
-                dynamic_b.active_source_to_payload_injective,
-                dynamic_b.payload_fully_initialized,
-                dynamic_b.tiles.view.dense_tiles == 0, true);
         if (!dmma_cuda_ok(cudaDeviceSynchronize(),
                           "presynchronize ours timed Core sample"))
             goto cleanup;
         const std::chrono::steady_clock::time_point core_begin =
             std::chrono::steady_clock::now();
-        if (options.b_update == B_UPDATE_STRUCTURE ||
-            options.b_update == B_UPDATE_PERMUTATION)
-        {
-            update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
-                                  &update_stats);
-        }
-        else
-        {
-            const DmmaOwnedDeviceCsr &source =
-                general_ab ? device_b : prepared_a.csr;
-            if (options.b_values_clear_policy ==
-                DMMA_B_VALUES_ALWAYS_CLEAR)
-                update_ok = gpu_update_dynamic_b_values(
-                    source.values, source.nnz, &dynamic_b, &update_stats);
-            else
-                update_ok = gpu_update_dynamic_b_values_with_policy(
-                    source.values, source.nnz, &dynamic_b,
-                    options.b_values_clear_policy, &update_clear_decision,
-                    &update_stats);
-        }
+        update_ok = rebuild_b(options, prepared_a, device_b, &dynamic_b,
+                              &update_stats);
         if (!update_ok)
         {
             std::fprintf(stderr, "B update failed at iteration %d.\n",
@@ -2317,17 +2236,8 @@ int main(int argc, char **argv)
             0.0, single_shot_all_cost_ms -
                      dmma_stats.super16_index_prepare_ms);
         const double tile_compatible_dmma_ms = dmma_stats.total_ms;
-        print_b_values_clear_marker("timed", iteration + 1, options,
-                                    dynamic_b, update_clear_decision);
-        if (b_update_uses_online_value_scatter(options.b_update))
-        {
-            if (update_clear_decision.skip_clear)
-                ++b_values_noclear_timed_samples;
-            else
-                ++b_values_clear_timed_samples;
-            if (update_clear_decision.fallback)
-                ++b_values_clear_fallback_timed_samples;
-        }
+        print_b_online_prep_marker("timed", iteration + 1, options,
+                                   dynamic_b);
 
         double restore_ms = 0.0;
         if (materialize_output)
@@ -2367,6 +2277,9 @@ int main(int argc, char **argv)
             dmma_stats.workspace_fallback_to_atomic;
         summary_context_reused =
             summary_context_reused || dmma_stats.split_context_reused;
+        summary_fused_csr_row_permute =
+            summary_fused_csr_row_permute ||
+            update_stats.fused_csr_row_permute;
         if (!summary_direct_numeric_layout_initialized)
         {
             summary_direct_numeric_layout =
@@ -2381,6 +2294,14 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         b_update_times.push_back(update_stats.total_ms);
+        b_csr_row_permute_times.push_back(
+            update_stats.csr_row_permute_ms);
+        b_csr2tile_times.push_back(
+            update_stats.total_ms - update_stats.csr_row_permute_ms);
+        b_sort_reduce_times.push_back(update_stats.key_sort_reduce_ms);
+        b_tile_build_times.push_back(update_stats.tile_build_ms);
+        b_csc_build_times.push_back(update_stats.csc_ms);
+        b_c16_view_times.push_back(update_stats.super16_build_ms);
         dmma_times.push_back(tile_compatible_dmma_ms);
         combined_times.push_back(combined_ms);
         single_shot_all_cost_times.push_back(single_shot_all_cost_ms);
@@ -2839,17 +2760,38 @@ int main(int argc, char **argv)
                 median(single_shot_all_cost_times),
                 maximum(single_shot_all_cost_times));
     std::printf(
-        "B_VALUES_CLEAR_SUMMARY requested=%s b_update=%s timed_samples=%d "
-        "clear_samples=%d noclear_samples=%d fallback_samples=%d "
-        "legacy_always_clear_entrypoint=%d timing_boundary=unchanged\n",
-        dmma_b_values_clear_policy_name(options.b_values_clear_policy),
+        "B_ONLINE_PREP_SUMMARY mode=%s "
+        "path=%s "
+        "source_mapping=disabled "
+        "total_samples_ms=",
         b_update_mode_name(options.b_update),
-        b_update_uses_online_value_scatter(options.b_update)
-            ? options.iterations
-            : 0,
-        b_values_clear_timed_samples, b_values_noclear_timed_samples,
-        b_values_clear_fallback_timed_samples,
-        options.b_values_clear_policy == DMMA_B_VALUES_ALWAYS_CLEAR ? 1 : 0);
+        summary_fused_csr_row_permute
+            ? "CSR-row-permute+ordered-CSR2Tile-fused-warp"
+            : "CSR-row-permute-then-ordered-CSR2Tile-warp");
+    print_samples(b_update_times);
+    std::printf(" total_min_ms=%.6f total_median_ms=%.6f "
+                "csr_row_permute_samples_ms=",
+                minimum(b_update_times), median(b_update_times));
+    print_samples(b_csr_row_permute_times);
+    std::printf(" csr_row_permute_min_ms=%.6f "
+                "csr_row_permute_median_ms=%.6f csr2tile_samples_ms=",
+                minimum(b_csr_row_permute_times),
+                median(b_csr_row_permute_times));
+    print_samples(b_csr2tile_times);
+    std::printf(" csr2tile_min_ms=%.6f csr2tile_median_ms=%.6f "
+                "mapping_ms=0.000000 fused_csr_row_permute=%d\n",
+                minimum(b_csr2tile_times), median(b_csr2tile_times),
+                summary_fused_csr_row_permute ? 1 : 0);
+    std::printf(
+        "B_ONLINE_PREP_PHASE_SUMMARY "
+        "sort_reduce_min_ms=%.6f sort_reduce_median_ms=%.6f "
+        "tile_build_min_ms=%.6f tile_build_median_ms=%.6f "
+        "csc_build_min_ms=%.6f csc_build_median_ms=%.6f "
+        "c16_view_min_ms=%.6f c16_view_median_ms=%.6f\n",
+        minimum(b_sort_reduce_times), median(b_sort_reduce_times),
+        minimum(b_tile_build_times), median(b_tile_build_times),
+        minimum(b_csc_build_times), median(b_csc_build_times),
+        minimum(b_c16_view_times), median(b_c16_view_times));
 
     if (stdout_suppressed)
     {
@@ -2878,8 +2820,12 @@ int main(int argc, char **argv)
                     effective_schedule_name(schedule_config.mode,
                                             schedule_config.cost_balanced),
                     options.iterations);
-        std::printf("B permutation runtime is %.3f ms\n",
+        std::printf("B online preparation runtime is %.3f ms\n",
                     b_update_times[selected]);
+        std::printf("  CSR row permutation is %.3f ms; "
+                    "CSR2Tile plus C16 view is %.3f ms\n",
+                    b_csr_row_permute_times[selected],
+                    b_csr2tile_times[selected]);
         std::printf("Symbolic runtime is %.3f ms\n",
                     symbolic_stage_times[selected]);
         std::printf("Malloc runtime is %.3f ms\n",
@@ -2890,6 +2836,7 @@ int main(int argc, char **argv)
                     runtime_ms, gflops);
         std::printf("RTT_RESULT matrix=%s mode=%s repeats=%d statistic=median "
                     "selected_iteration=%zu b_permutation_ms=%.6f "
+                    "b_csr_row_permute_ms=%.6f b_csr2tile_ms=%.6f "
                     "symbolic_ms=%.6f malloc_ms=%.6f "
                     "numeric_ms=%.6f runtime_ms=%.6f gflops=%.6f "
                     "input_h2d_included=0 output_d2h_included=0 "
@@ -2898,7 +2845,10 @@ int main(int argc, char **argv)
                     effective_schedule_name(schedule_config.mode,
                                             schedule_config.cost_balanced),
                     options.iterations, selected + 1,
-                    b_update_times[selected], symbolic_stage_times[selected],
+                    b_update_times[selected],
+                    b_csr_row_permute_times[selected],
+                    b_csr2tile_times[selected],
+                    symbolic_stage_times[selected],
                     allocation_stage_times[selected],
                     numeric_stage_times[selected], runtime_ms, gflops);
     }

@@ -31,6 +31,7 @@ struct DmmaOwnedDeviceTiles
 {
     DmmaDeviceTiles view{};
     int *tile_row_ptr = nullptr;
+    void *metadata_storage = nullptr;
     int *tile_col_idx = nullptr;
     int *value_offsets = nullptr;
     std::uint32_t *masks = nullptr;

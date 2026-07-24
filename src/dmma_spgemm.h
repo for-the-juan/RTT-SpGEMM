@@ -207,6 +207,7 @@ struct DmmaOwnedDeviceTiles
 {
     DmmaDeviceTiles view{};
     int *tile_row_ptr = nullptr;
+    void *metadata_storage = nullptr;
     int *tile_col_idx = nullptr;
     int *value_offsets = nullptr;
     uint32_t *masks = nullptr;
@@ -1550,9 +1551,14 @@ static inline void destroy_device_tiles(DmmaOwnedDeviceTiles *tiles)
     if (tiles == nullptr)
         return;
     cudaFree(tiles->tile_row_ptr);
-    cudaFree(tiles->tile_col_idx);
-    cudaFree(tiles->value_offsets);
-    cudaFree(tiles->masks);
+    if (tiles->metadata_storage != nullptr)
+        cudaFree(tiles->metadata_storage);
+    else
+    {
+        cudaFree(tiles->tile_col_idx);
+        cudaFree(tiles->value_offsets);
+        cudaFree(tiles->masks);
+    }
     cudaFree(tiles->values);
     cudaFree(tiles->tile_col_ptr);
     cudaFree(tiles->tile_row_idx);
